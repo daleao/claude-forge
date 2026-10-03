@@ -241,6 +241,7 @@ skills/
   research  prototype                      detours during discovery
   retro  architecture-survey  handoff      around the flow
   setup (+ NEW-PROJECT.md)  help           once per repo, or from an empty folder; the map
+LICENSE                      MIT, for this project
 licenses/                    MIT licences of the four source projects
 LINEAGE.md                   per-asset lineage and reasoning
 ```
