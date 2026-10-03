@@ -354,3 +354,13 @@ Each was kept only if an implementer plausibly gets it wrong without it. Phrased
 | GSD's 33 agents, 67 commands, SDK, installer, `.planning/` tree | role-based, process-owning; its ideas were taken (state file, context monitor, deviation rules, goal-backward verification, overlap check, requirement IDs) and nothing else |
 | GSD statusline, update checker, prompt-injection scanners, commit validators | product infrastructure |
 | The Brief's seven-directory memory tree | mapped onto locations that already had owners (`GLOSSARY.md`, `docs/adr/`, issues, `.forge/`) instead of adding `architecture/`, `domain/`, `specs/`, `decisions/`, `tasks/`, `state/` directories. Same layers, fewer places |
+
+## Build status notes
+
+Moved here from the README.
+
+The `forge` script was exercised end to end against stub `gh` and `claude` binaries in a scratch repo: parallel slices, a multi-iteration slice, a merge conflict sent to the resolver, a false "done" reopened by the gate, a stall escalated then parked, a dependent slice held back, unblock and resume, a QA fix round, PR creation and finalisation, a usage limit mid-build (pause, then resume), an empty reviewer report (audit reported incomplete), the usage threshold with fresh and stale readings, and a new project with an empty gate, where the foundation slice's first "done" is refused for having no gate and its second defines one that passes. The context-guard hook was tested against synthetic and real transcripts. The plugin manifest passes `claude plugin validate --strict`.
+
+Not yet done: a run against the live `claude` and `gh` CLIs. Two things in particular rest on assumptions a live run will confirm or correct: that `claude -p` exits non-zero when the usage limit is hit (the script also recognises the limit message in an otherwise empty run), and the exact wording of that message (`LIMIT_RE` in `scripts/forge`). Expect to tune `FORGE_ALLOWED_TOOLS` and the prompts on your first real run; start with a small spec and `--max-parallel 1`.
+
+Since then, `forge doctor` has been run against the live `gh` from a sandboxed session; the other `forge issue` and `forge pr` commands have been run only against a stub.

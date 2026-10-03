@@ -11,30 +11,29 @@ A workflow for building software with Claude Code: you and the agent sharpen an 
 └───────────────────────────┘   └────────────────────────────────────────┘   └────────┘
 ```
 
-It is assembled from four published projects, keeping one mechanism per job:
+What you get:
 
-| Job | Mechanism | Mainly from |
-| --- | --- | --- |
-| Discovery, spec, slicing | interview in rounds; spec sized to the work; vertical slices as a task graph | Matt Pocock's skills |
-| How long an agent keeps going | Ralph loop: fresh headless contexts until a gate passes | the `forge` script (new) |
-| Correctness of each increment | TDD, red before green | Matt Pocock + Superpowers |
-| Staying coherent over a long build | durable state file per slice, fresh context per iteration, a context guard | GSD's ideas, rebuilt small |
-| "Prove it" | a gate the script runs itself; three independent QA reviewers; bounded fix rounds | Superpowers + GSD + Matt Pocock |
-| Engineering judgement | a short constitution for implementers, book-derived lenses for the reviewer | agent-rules-books |
+- **Discovery that asks only what matters.** An interview in rounds, a spec sized to the work, and vertical slices published as a task graph of GitHub issues.
+- **An unattended build loop.** Each slice runs in its own worktree, in fresh headless contexts, until a gate you define passes. Slices that don't block each other run in parallel.
+- **Test-first increments.** Red before green, one commit per increment.
+- **Coherence over a long build.** A durable state file per slice, a fresh context per iteration, and a guard that checkpoints before the context window fills.
+- **Proof, not claims.** The script runs the gate itself, three independent reviewers audit the result, and fix rounds are bounded.
+- **A human decision at the end.** The run produces a PR and a report that leads with what needs your judgement. Nothing merges into your base branch without you.
 
-[LINEAGE.md](LINEAGE.md) records, file by file, what each asset was based on, what was added from where, what was cut, and why.
+Forge builds on four open-source projects; see [Credits](#credits).
 
 ## Requirements
 
-- Claude Code (tested against the CLI flags of 2.1.x: `-p`, `--agent`, `--plugin-dir`, `--permission-mode`, `--allowedTools`, `--add-dir`)
+- Claude Code 2.1 or newer
 - `git`, `jq`, `bash` ≥ 5.1
 - The GitHub CLI `gh`, authenticated. Specs and slices are GitHub issues; the result is a PR.
 
 ## Install
 
-**1. The plugin** (skills, QA agents, context-guard hook). From wherever you keep this folder:
+**1. The plugin** (skills, QA agents, context-guard hook). Clone the repository somewhere permanent, since the `forge` command is linked from it, then install from that folder:
 
 ```bash
+git clone https://github.com/daleao/claude-forge.git
 claude plugin marketplace add /path/to/claude-forge
 claude plugin install forge@forge-local
 ```
@@ -92,7 +91,7 @@ gh label delete "forge:spec" --yes; gh label delete "forge:slice" --yes
 
 Then remove the two pointer lines `/forge:setup` added to `CLAUDE.md`, and commit. Integration branches pushed to GitHub (`forge/<spec>/integration`) are deleted there, or by the PR's "delete branch" button on merge.
 
-Left in place on purpose: `GLOSSARY.md` and `docs/adr/` (your project's documentation), and the issues and PRs on GitHub (your project's history).
+Not removed: `GLOSSARY.md` and `docs/adr/` (your project's documentation), and the issues and PRs on GitHub (your project's history).
 
 ## The workflow, step by step
 
@@ -231,7 +230,7 @@ prompts/                     what each headless context is told
 agents/                      the QA reviewers (by axis, not persona)
   qa-spec.md  qa-tests.md  qa-code.md  qa-recheck.md
 hooks/                       context guard (PostToolUse)
-templates/                   config.sh, constitution.md, state.md
+templates/                   config.sh, constitution.md, state.md, sandbox-settings.json
 skills/
   grill  spec  slice  run  review          the five steps (user-invoked)
   grilling  domain-modeling                discovery primitives
@@ -243,7 +242,7 @@ skills/
   setup (+ NEW-PROJECT.md)  help           once per repo, or from an empty folder; the map
 LICENSE                      MIT, for this project
 licenses/                    MIT licences of the four source projects
-LINEAGE.md                   per-asset lineage and reasoning
+LINEAGE.md                   where each part came from, and why it is the way it is
 ```
 
 ## Configuration
@@ -274,9 +273,7 @@ LINEAGE.md                   per-asset lineage and reasoning
 
 ## Sandboxed sessions
 
-With Claude Code's Bash sandbox on, a session's commands have no network, so `gh` fails there (it reports an invalid token; the token is fine). Opening the sandbox to `api.github.com` would fix that the wrong way: every sandboxed command, including your test suite and anything a package installs, could then read your `gh` token and use it on any repository you can reach.
-
-Forge keeps GitHub outside the sandbox instead. A session never calls `gh`. It calls a few fixed `forge` commands, and only those run unsandboxed:
+Forge works with Claude Code's Bash sandbox switched on, without opening the sandbox to GitHub. A session never calls `gh`. It calls a few fixed `forge` commands, and only those run outside the sandbox, so your test suite and anything a package installs still have no network and no access to your GitHub token:
 
 | Command | What it can do |
 | --- | --- |
@@ -291,14 +288,27 @@ They act on the `origin` repository only, take no other flags, and do not read `
 
 The settings are in [`templates/sandbox-settings.json`](templates/sandbox-settings.json); `/forge:setup` offers to merge them into your `~/.claude/settings.json`. They do three things:
 
-- `sandbox.excludedCommands` takes those commands, plus `forge run` and `forge qa` (which start the headless agents and push), out of the sandbox. Not `forge *`: `status`, `unblock` and `clean` need nothing outside it.
+- `sandbox.excludedCommands` takes those commands, plus `forge run` and `forge qa` (which start the headless agents and push), out of the sandbox. `forge status`, `unblock` and `clean` stay inside it.
 - `permissions` lets the read-only commands run without a prompt and asks before each one that writes or launches a run.
 - `sandbox.filesystem.denyRead` hides `~/.config/gh` from sandboxed commands. If `gh` keeps its token in your system keyring this changes nothing; it is there for the plain-file case.
 
-Two rules follow from how Claude Code matches excluded commands, and the skills observe them: a `forge` command must be the whole Bash call (a pipe, a redirect, a `cd` or a second command keeps the call sandboxed), which is why `forge run` has `--log <file>`. And an organisation that locks the sandbox in managed settings may ignore `excludedCommands` from your own files; ask your administrator to add them.
+Two things to know. A `forge` command must be the whole Bash call: a pipe, a redirect, a `cd` or a second command keeps the call sandboxed, so use `forge run <spec> --log <file>` to capture a run's output. And if your organisation locks the sandbox in managed settings, `excludedCommands` in your own files may be ignored; ask your administrator to add them.
 
-## Status of this build
+## Status
 
-The `forge` script was exercised end to end against stub `gh` and `claude` binaries in a scratch repo: parallel slices, a multi-iteration slice, a merge conflict sent to the resolver, a false "done" reopened by the gate, a stall escalated then parked, a dependent slice held back, unblock and resume, a QA fix round, PR creation and finalisation, a usage limit mid-build (pause, then resume), an empty reviewer report (audit reported incomplete), the usage threshold with fresh and stale readings, and a new project with an empty gate, where the foundation slice's first "done" is refused for having no gate and its second defines one that passes. The context-guard hook was tested against synthetic and real transcripts. The plugin manifest passes `claude plugin validate --strict`.
+Forge is new. The script has been tested end to end against stub `gh` and `claude` binaries, covering parallel slices, merge conflicts, stalls, pauses and resumes, and the QA rounds; it has had little use against real projects yet. Start with a small spec and `--max-parallel 1`, and expect to tune `FORGE_ALLOWED_TOOLS` and the prompts for your project. Issues and pull requests are welcome.
 
-Not yet done: a run against the live `claude` and `gh` CLIs. `gh` was not installed on the machine this was built on. Two things in particular rest on assumptions a live run will confirm or correct: that `claude -p` exits non-zero when the usage limit is hit (the script also recognises the limit message in an otherwise empty run), and the exact wording of that message (`LIMIT_RE` in `scripts/forge`). Expect to tune `FORGE_ALLOWED_TOOLS` and the prompts on your first real run; start with a small spec and `--max-parallel 1`.
+## Credits
+
+Forge selects and adapts ideas from four MIT-licensed projects, whose licences are in [`licenses/`](licenses/):
+
+- [Matt Pocock's skills](https://github.com/mattpocock/skills): the interview, the spec and vertical slicing, and much of the TDD discipline
+- [Superpowers](https://github.com/obra/superpowers) (Jesse Vincent): TDD, verification before claims, worktree practice
+- get-shit-done (Lex Christopherson; now continued as [gsd-core](https://github.com/open-gsd/gsd-core)): durable state across fresh contexts
+- agent-rules-books (Maciej Ciemborowicz): the constitution and the review lenses
+
+[LINEAGE.md](LINEAGE.md) records, file by file, what each part was based on, what was added, what was cut, and why.
+
+## License
+
+[MIT](LICENSE)
