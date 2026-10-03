@@ -1,0 +1,14 @@
+{
+  "name": "forge-local",
+  "owner": {
+    "name": "daleao"
+  },
+  "description": "The Forge workflow plugin, installable from this folder.",
+  "plugins": [
+    {
+      "name": "forge",
+      "source": "./",
+      "description": "Grill, spec, slice, then an unattended Ralph loop with TDD and an adversarial QA phase, ending in a human-reviewed PR."
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "sandbox": {
+    "excludedCommands": [
+      "forge issue *",
+      "forge pr *",
+      "forge doctor",
+      "forge run *",
+      "forge qa *"
+    ],
+    "filesystem": {
+      "denyRead": ["~/.config/gh"]
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(forge issue view *)",
+      "Bash(forge pr view *)",
+      "Bash(forge doctor)"
+    ],
+    "ask": [
+      "Bash(forge issue create *)",
+      "Bash(forge issue edit *)",
+      "Bash(forge pr push *)",
+      "Bash(forge run *)",
+      "Bash(forge qa *)"
+    ]
+  }
+}

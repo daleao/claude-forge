@@ -1,0 +1,17 @@
+{
+  "name": "forge",
+  "version": "0.1.0",
+  "description": "Grill, spec, slice, then an unattended Ralph loop with TDD and an adversarial QA phase, ending in a human-reviewed PR.",
+  "license": "MIT",
+  "keywords": [
+    "workflow",
+    "grilling",
+    "spec",
+    "tdd",
+    "ralph-loop",
+    "qa"
+  ],
+  "author": {
+    "name": "daleao"
+  }
+}

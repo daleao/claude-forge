@@ -1,0 +1,871 @@
+#!/usr/bin/env bash
+# forge: the unattended half of the Forge workflow.
+#
+#   forge run <spec>      work the spec's slices to a reviewed draft PR
+#   forge qa <spec>       (re)run the autonomous QA phase on the integration branch
+#   forge status <spec>   show every slice's status and the current frontier
+#   forge unblock <spec> <slice>   put a blocked slice back on the frontier
+#   forge clean <spec>    remove the spec's worktrees (branches and run state stay)
+#
+# GitHub for interactive sessions: fixed verbs, always against origin.
+#   forge issue view <n>          an issue's title, state, labels and body
+#   forge issue create <spec|slice> --title <t> --body-file <f>
+#   forge issue edit <n> --body-file <f>   replace the body of a spec or slice
+#   forge pr view <spec>          the run's PR and the files it changes
+#   forge pr push <spec>          push the integration branch
+#   forge doctor                  check the tools, the GitHub login, the remote
+#
+# Exit status 75 means the run paused itself at a safe point (usage limit, or a
+# failed agent call). Nothing is lost: run the same command again to resume.
+#
+# A spec is a GitHub issue whose body has a "## Slices" task list. Each slice
+# is an issue with "## Blocked by" and "## Touches" sections. An issue with no
+# Slices list is run as a single slice.
+#
+# Three loops, one inside the next:
+#   scheduler   keeps the frontier (slices whose blockers merged) running,
+#               up to FORGE_MAX_PARALLEL, each in its own worktree
+#   Ralph       per slice: fresh `claude -p` contexts, one after another,
+#               until the gate passes; memory lives in the slice's state file
+#   TDD         inside each context (the forge:tdd skill)
+
+set -euo pipefail
+
+if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1) )); then
+  echo "forge: needs bash >= 5.1 (found $BASH_VERSION)" >&2; exit 1
+fi
+
+FORGE_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+CLAUDE="${FORGE_CLAUDE_BIN:-claude}"
+GH="${FORGE_GH_BIN:-gh}"
+
+die() { echo "forge: $*" >&2; exit 1; }
+log() { printf '[forge %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<'EOF'
+
+Options for `run`:
+  --yolo             run agents with --dangerously-skip-permissions (sandbox only)
+  --local            no push, no PR, no issue comments; the report stays on disk
+  --skip-qa          stop after the slices are merged
+  --max-parallel N   override FORGE_MAX_PARALLEL
+  --log FILE         write all output to FILE (a sandboxed session cannot redirect it)
+EOF
+}
+
+# ---------------------------------------------------------------- config ----
+
+# What agents may do without --yolo when the config lists nothing.
+DEFAULT_TOOLS=(Read Edit Write Glob Grep Skill
+  "Bash(git status:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(git add:*)"
+  "Bash(git commit:*)" "Bash(git merge:*)" "Bash(git checkout:*)" "Bash(git rm:*)" "Bash(git mv:*)"
+  "Bash(git restore:*)" "Bash(mkdir:*)" "Bash(ls:*)")
+
+default_branch() { # the repo's default branch, without asking anyone
+  local b; b="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)"; b="${b#origin/}"
+  if [[ -n "$b" ]]; then echo "$b"
+  elif git show-ref --verify --quiet refs/heads/main; then echo main
+  elif git show-ref --verify --quiet refs/heads/master; then echo master
+  else git symbolic-ref -q --short HEAD 2>/dev/null || echo main; fi
+}
+
+load_config() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+  REPO="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
+  [[ -f "$REPO/.forge/config.sh" ]] || die "no .forge/config.sh in $REPO (run /forge:setup)"
+  FORGE_ALLOWED_TOOLS=()
+  # shellcheck disable=SC1091
+  source "$REPO/.forge/config.sh"
+  : "${FORGE_VERIFY_CMD:=}" "${FORGE_SETUP_CMD:=}"
+  [[ -n "${FORGE_BASE_BRANCH:-}" ]] || FORGE_BASE_BRANCH="$(default_branch)"
+  : "${FORGE_MAX_PARALLEL:=3}" "${FORGE_MAX_ITERATIONS:=10}" "${FORGE_STALL_LIMIT:=2}"
+  : "${FORGE_QA_MAX_ROUNDS:=2}" "${FORGE_MODEL_IMPLEMENT:=sonnet}"
+  : "${FORGE_MODEL_ESCALATE:=opus}" "${FORGE_MODEL_QA:=opus}"
+  : "${FORGE_USAGE_STOP_PERCENT=90}" "${FORGE_USAGE_MAX_AGE:=900}"   # set it to "" to switch the threshold off
+  (( ${#FORGE_ALLOWED_TOOLS[@]} )) || FORGE_ALLOWED_TOOLS=("${DEFAULT_TOOLS[@]}")
+  USAGE_FILE="${FORGE_USAGE_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/forge/usage.json}"
+  CONSTITUTION="$REPO/.forge/constitution.md"
+  # Headless contexts load this plugin from disk. If your Claude Code version
+  # objects to that alongside an installed copy, set FORGE_NO_PLUGIN_DIR=1.
+  PLUGIN_ARGS=(--plugin-dir "$FORGE_HOME"); [[ -z "${FORGE_NO_PLUGIN_DIR:-}" ]] || PLUGIN_ARGS=()
+  YOLO=0; LOCAL=0; SKIP_QA=0; FOUNDATION=""
+}
+
+init_spec() {
+  SPEC="$1"
+  [[ "$SPEC" =~ ^[0-9]+$ ]] || die "spec must be an issue number, got '$SPEC'"
+  RUN="$REPO/.forge/runs/$SPEC"
+  WT="$REPO/.forge/worktrees/$SPEC"
+  INT="$WT/integration"
+  INT_BRANCH="forge/$SPEC/integration"
+  mkdir -p "$RUN/slices" "$RUN/external" "$RUN/qa"
+}
+
+# ------------------------------------------------------------- utilities ----
+
+# section <file> <heading>: the body under "## <heading>", up to the next "## ".
+section() {
+  awk -v want="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" '
+    /^## / { h = tolower(substr($0, 4)); sub(/[ \t\r]+$/, "", h); on = (h == want); next }
+    on' "$1"
+}
+
+refs() { { grep -oE '#[0-9]+' || true; } | tr -d '#' | sort -un; }
+
+# render <template> KEY=value...: fill {{KEY}} placeholders.
+render() {
+  local text kv; text="$(cat "$1")"; shift
+  for kv in "$@"; do text="${text//"{{${kv%%=*}}}"/"${kv#*=}"}"; done
+  printf '%s\n' "$text"
+}
+
+snapshot_issue() { # <number> <file>: the issue as markdown, body only (comments are never read)
+  "$GH" issue view "$1" --json number,title,body \
+    | jq -r '"# \(.title)\n\nIssue: #\(.number)\n\n\(.body)"' > "$2" \
+    || die "cannot read issue #$1 (is gh authenticated, and does the issue exist?)"
+}
+
+title_of() { head -n1 "$1" | sed 's/^# //'; }
+status_of() { cat "$RUN/slices/$1/status" 2>/dev/null || echo pending; }
+set_status() { printf '%s\n' "$2" > "$RUN/slices/$1/status"; }
+ledger() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$RUN/ledger.md"; }
+
+block() { # <slice> <reason>
+  set_status "$1" blocked
+  printf '%s\n' "$2" > "$RUN/slices/$1/blocked-reason"
+  ledger "slice $1: blocked: $2"
+  log "slice #$1 BLOCKED: $2"
+}
+
+# A halt pauses the whole run at a safe point: nothing new starts, each running
+# slice stops before its next iteration, and every slice stays resumable.
+halt() { [[ -f "$RUN/halt" ]] || { printf '%s\n' "$1" > "$RUN/halt"; ledger "halt: $1"; log "PAUSING: $1"; }; }
+halted() { [[ -f "$RUN/halt" ]]; }
+
+LIMIT_RE='usage limit|hit your limit|limit reached|rate limit exceeded|out of extra usage'
+looks_limited() { tail -n 5 "$1" 2>/dev/null | grep -qiE "$LIMIT_RE"; }
+
+# agent_failure <logfile>: why the call itself failed (as opposed to the work
+# going badly), or nothing. A failed call is never counted as a stall.
+agent_failure() {
+  local rc; rc="$(cat "$1.rc" 2>/dev/null || echo 0)"
+  (( rc != 0 )) || return 0
+  if looks_limited "$1" || looks_limited "$1.err"; then echo "usage limit reached"; else echo "agent call failed (exit $rc)"; fi
+}
+
+# reviewer_failure <report> <regex a real report matches>: an empty or
+# malformed report is a failed audit, never a clean one.
+reviewer_failure() {
+  local why; why="$(agent_failure "$1")"
+  if [[ -n "$why" ]]; then echo "$why"
+  elif ! grep -qE "$2" "$1" 2>/dev/null; then
+    if looks_limited "$1"; then echo "usage limit reached"; else echo "its output is not a report"; fi
+  fi
+}
+
+# usage_check: halt when the subscription usage recorded by the status line
+# script (scripts/usage-statusline.sh) is at or over FORGE_USAGE_STOP_PERCENT.
+# Readings older than FORGE_USAGE_MAX_AGE seconds are ignored: the status line
+# only updates while an interactive session is active.
+usage_check() {
+  [[ -n "$FORGE_USAGE_STOP_PERCENT" && -f "$USAGE_FILE" ]] || return 0
+  local over
+  over="$(jq -r --argjson now "$(date +%s)" --argjson max "$FORGE_USAGE_MAX_AGE" --argjson stop "$FORGE_USAGE_STOP_PERCENT" '
+    select(($now - (.recorded_at // 0)) <= $max) as $u
+    | [ ("five_hour", "seven_day") as $w | $u[$w] // empty
+        | select(.used_percentage != null and .used_percentage >= $stop and ((.resets_at // ($now + 1)) > $now))
+        | "\($w | sub("_"; "-")) usage at \(.used_percentage | floor)%" ]
+    | first // empty' "$USAGE_FILE" 2>/dev/null)" || return 0
+  [[ -z "$over" ]] || halt "$over, at or over FORGE_USAGE_STOP_PERCENT=$FORGE_USAGE_STOP_PERCENT"
+}
+
+usage_note() { # say plainly when the threshold cannot be enforced
+  [[ -n "$FORGE_USAGE_STOP_PERCENT" ]] || return 0
+  local age=999999
+  [[ -f "$USAGE_FILE" ]] && age=$(( $(date +%s) - $(jq -r '.recorded_at // 0' "$USAGE_FILE" 2>/dev/null || echo 0) ))
+  (( age <= FORGE_USAGE_MAX_AGE )) || log "note: no fresh usage reading at $USAGE_FILE; the $FORGE_USAGE_STOP_PERCENT% threshold is not enforced until one appears (a hard limit still pauses the run)"
+}
+
+kill_tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
+
+state_status() { { grep -m1 -E '^Status:' "$1" || true; } | awk '{print $2}'; }
+set_state_status() { # <state file> <status>
+  awk -v s="$2" '!done && /^Status:/ { print "Status: " s; done = 1; next } { print }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+# cfg <dir> <VAR>: a setting as that checkout's own .forge/config.sh defines
+# it, falling back to the config loaded at start. A slice may change the gate
+# (the foundation slice of a new project creates it), and the change must apply
+# to that slice and to the integration branch once it merges.
+cfg() {
+  local v=""
+  if [[ -f "$1/.forge/config.sh" ]]; then
+    v="$( set +eu; FORGE_ALLOWED_TOOLS=(); unset "$2"; source "$1/.forge/config.sh" >/dev/null 2>&1; printf '%s' "${!2:-}" )" || v=""
+  fi
+  if [[ -n "$v" ]]; then printf '%s' "$v"; else printf '%s' "${!2:-}"; fi
+}
+
+gate_text() { # <dir>: the gate command as shown to an agent
+  local c; c="$(cfg "$1" FORGE_VERIFY_CMD)"
+  if [[ -n "$c" ]]; then printf '%s' "$c"
+  else printf '%s' "(not defined yet: this slice defines it, as FORGE_VERIFY_CMD in .forge/config.sh, from the spec's \"Project foundation\" section)"; fi
+}
+
+gate() { # <dir> <logfile>: run the verify command; exit status is the verdict
+  local cmd; cmd="$(cfg "$1" FORGE_VERIFY_CMD)"
+  if [[ -z "$cmd" ]]; then echo "No gate is defined: FORGE_VERIFY_CMD is empty in .forge/config.sh." > "$2"; return 1; fi
+  ( cd "$1" && bash -c "$cmd" ) > "$2" 2>&1
+}
+
+# int_gate <logfile>: the gate on the integration worktree, after refreshing
+# its dependencies (a merged slice may have added some).
+int_gate() {
+  local setup; setup="$(cfg "$INT" FORGE_SETUP_CMD)"
+  if [[ -n "$setup" ]]; then ( cd "$INT" && bash -c "$setup" ) > "$1" 2>&1 || return 1; fi
+  gate "$INT" "$1"
+}
+
+# Bash(<command>:*) for each command the gate and setup commands start with.
+# Read only from the config loaded at start (the one a human committed), never
+# from a slice's checkout: an agent must not be able to widen its own permissions.
+derived_tools() {
+  local seg w
+  printf '%s\n%s\n' "$FORGE_VERIFY_CMD" "$FORGE_SETUP_CMD" | tr ';&|' '\n\n\n' | while read -r seg; do
+    for w in $seg; do
+      [[ "$w" == *=* ]] && continue
+      [[ "$w" =~ ^[A-Za-z0-9_./-]+$ ]] && echo "Bash($w:*)"
+      break
+    done
+  done | sort -u
+}
+
+perm_args() { # prints one arg per line: the permission flags for a writing agent
+  if (( YOLO )); then
+    echo "--dangerously-skip-permissions"
+  else
+    echo "--permission-mode"; echo "acceptEdits"
+    echo "--allowedTools"; printf '%s\n' "${FORGE_ALLOWED_TOOLS[@]}"; derived_tools
+  fi
+}
+
+# agent <cwd> <model> <logfile> [extra claude args...]: one fresh headless
+# context. The prompt arrives on stdin. Its exit status lands in <logfile>.rc;
+# the caller judges the work by what is on disk, and the call by agent_failure.
+agent() {
+  local cwd="$1" model="$2" out="$3" rc=0; shift 3
+  local -a perms; mapfile -t perms < <(perm_args)
+  ( cd "$cwd" && FORGE_LOOP=1 "$CLAUDE" -p --model "$model" "${PLUGIN_ARGS[@]}" \
+      --add-dir "$RUN" "${perms[@]}" "$@" ) > "$out" 2>&1 || rc=$?
+  echo "$rc" > "$out.rc"
+}
+
+# reviewer <agent> <model> <outfile>: a read-only headless context whose final
+# message is its report. Prompt on stdin.
+reviewer() {
+  local name="$1" model="$2" out="$3" rc=0
+  local -a perms
+  if (( YOLO )); then perms=(--dangerously-skip-permissions)
+  else perms=(--allowedTools Read Grep Glob "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"); fi
+  ( cd "$INT" && "$CLAUDE" -p --agent "forge:$name" --model "$model" "${PLUGIN_ARGS[@]}" \
+      --add-dir "$RUN" --add-dir "$FORGE_HOME" "${perms[@]}" ) > "$out" 2> "$out.err" || rc=$?
+  echo "$rc" > "$out.rc"
+}
+
+# ------------------------------------------------------------- snapshots ----
+
+# Read the spec and its slices from GitHub once, into local files. Iterations
+# never touch the network, and a slice already under way keeps the ticket it
+# started with.
+snapshot_spec() {
+  snapshot_issue "$SPEC" "$RUN/spec.md"
+  mapfile -t SLICES < <(section "$RUN/spec.md" "Slices" | refs)
+  (( ${#SLICES[@]} )) || SLICES=("$SPEC")   # no Slices list: the issue is its own slice
+  local s b dir
+  for s in "${SLICES[@]}"; do
+    dir="$RUN/slices/$s"; mkdir -p "$dir"
+    [[ -f "$dir/status" ]] || set_status "$s" pending
+    [[ "$(status_of "$s")" == running ]] && set_status "$s" pending   # left over from a killed run
+    if [[ "$(status_of "$s")" == pending && ! -f "$dir/state.md" ]]; then
+      if [[ "$s" == "$SPEC" ]]; then cp "$RUN/spec.md" "$dir/ticket.md"; else snapshot_issue "$s" "$dir/ticket.md"; fi
+    fi
+    section "$dir/ticket.md" "Blocked by" | refs > "$dir/blocked-by"
+    section "$dir/ticket.md" "Touches" | sed -E 's/^[-* \t]+//; s/[ \t\r]+$//' \
+      | tr '[:upper:]' '[:lower:]' | { grep -v '^$' || true; } | sort -u > "$dir/touches"
+    # A slice with a "## Foundation" heading builds the project itself: the
+    # gate cannot pass before it merges, and every other slice waits for it.
+    if [[ -z "$FOUNDATION" ]] && grep -qiE '^## foundation[[:space:]]*$' "$dir/ticket.md"; then FOUNDATION="$s"; fi
+  done
+  for s in "${SLICES[@]}"; do
+    while read -r b; do
+      [[ -z "$b" || " ${SLICES[*]} " == *" $b "* ]] && continue
+      "$GH" issue view "$b" --json state -q .state > "$RUN/external/$b" 2>/dev/null || echo UNKNOWN > "$RUN/external/$b"
+    done < "$RUN/slices/$s/blocked-by"
+  done
+}
+
+# ---------------------------------------------------------------- frontier --
+
+blockers_merged() { # <slice>
+  local b
+  [[ -z "$FOUNDATION" || "$1" == "$FOUNDATION" || "$(status_of "$FOUNDATION")" == merged ]] || return 1
+  while read -r b; do
+    [[ -z "$b" ]] && continue
+    if [[ " ${SLICES[*]} " == *" $b "* ]]; then
+      [[ "$(status_of "$b")" == merged ]] || return 1
+    else
+      [[ "$(cat "$RUN/external/$b" 2>/dev/null)" == CLOSED ]] || return 1
+    fi
+  done < "$RUN/slices/$1/blocked-by"
+}
+
+overlaps_running() { # <slice>: does it share a Touches entry with a running slice?
+  local r
+  for r in "${SLICES[@]}"; do
+    [[ "$r" != "$1" && "$(status_of "$r")" == running ]] || continue
+    [[ -n "$(comm -12 "$RUN/slices/$1/touches" "$RUN/slices/$r/touches")" ]] && return 0
+  done
+  return 1
+}
+
+# ------------------------------------------------------------ Ralph loop ----
+
+signature() { printf '%s %s' "$(git -C "$1" rev-parse HEAD)" "$(cksum < "$2")"; }
+
+prepare_slice() { # <slice>: worktree + state file. Runs in the scheduler, never concurrently.
+  local s="$1" dir="$RUN/slices/$1" wt="$WT/slice-$1" br="forge/$SPEC/slice-$1"
+  if [[ ! -d "$wt" ]]; then
+    if git -C "$REPO" show-ref --verify --quiet "refs/heads/$br"; then
+      git -C "$REPO" worktree add "$wt" "$br" >/dev/null 2>&1
+    else
+      git -C "$REPO" worktree add -b "$br" "$wt" "$INT_BRANCH" >/dev/null 2>&1
+    fi
+    rm -f "$dir/setup-done"
+  fi
+  [[ -f "$dir/state.md" ]] || render "$FORGE_HOME/templates/state.md" "SLICE=$s" > "$dir/state.md"
+}
+
+slice_loop() { # <slice>: runs in the background; its verdict is the status file
+  local s="$1" dir="$RUN/slices/$1" wt="$WT/slice-$1"
+  local state="$dir/state.md" model="$FORGE_MODEL_IMPLEMENT"
+  local i=0 stall=0 escalated=0 before st stamp
+  # The foundation slice creates what the setup command installs, so it skips it.
+  local setup; setup="$(cfg "$wt" FORGE_SETUP_CMD)"
+  if [[ -n "$setup" && "$s" != "$FOUNDATION" && ! -f "$dir/setup-done" ]]; then
+    ( cd "$wt" && bash -c "$setup" ) > "$dir/setup.log" 2>&1 || { block "$s" "setup command failed (see $dir/setup.log)"; return; }
+    touch "$dir/setup-done"
+  fi
+  local fail
+  while (( i < FORGE_MAX_ITERATIONS )); do
+    usage_check
+    if halted; then set_status "$s" pending; log "slice #$s: paused before its next iteration"; return; fi
+    i=$((i + 1)); stamp="$(date +%Y%m%d-%H%M%S)"
+    before="$(signature "$wt" "$state")"
+    log "slice #$s: iteration $i ($model)"
+    render "$FORGE_HOME/prompts/implement.md" "CONSTITUTION=$CONSTITUTION" "TICKET=$dir/ticket.md" \
+        "STATE=$state" "SPEC=$RUN/spec.md" "VERIFY_CMD=$(gate_text "$wt")" \
+      | FORGE_STATE_FILE="$state" agent "$wt" "$model" "$dir/iter-$stamp.log"
+    # A call that failed (usage limit, network, crash) says nothing about the
+    # slice. Pause the run; the slice resumes from its state file.
+    fail="$(agent_failure "$dir/iter-$stamp.log")"
+    if [[ -z "$fail" && "$(signature "$wt" "$state")" == "$before" ]] && looks_limited "$dir/iter-$stamp.log"; then fail="usage limit reached"; fi
+    if [[ -n "$fail" ]]; then
+      halt "$fail in slice #$s (see $dir/iter-$stamp.log)"; set_status "$s" pending; return
+    fi
+    st="$(state_status "$state")"
+    if [[ "$st" == blocked ]]; then
+      block "$s" "agent stopped: $({ grep -m1 -E '^Next action:' "$state" || true; } | cut -c14-)"; return
+    fi
+    if [[ "$st" == done ]]; then
+      if [[ -n "$(git -C "$wt" status --porcelain)" ]]; then
+        printf -- '- %s: claimed done with uncommitted changes; commit them or discard them.\n' "$stamp" >> "$state"
+        set_state_status "$state" in-progress
+      elif gate "$wt" "$dir/gate.log"; then
+        set_status "$s" done; ledger "slice $s: done after $i iteration(s)"; log "slice #$s: gate passed"; return
+      else
+        { printf -- '- %s: claimed done, gate failed. Last lines:\n\n```\n' "$stamp"; tail -n 40 "$dir/gate.log"; printf '```\n'; } >> "$state"
+        set_state_status "$state" in-progress
+        log "slice #$s: claimed done but the gate is red; reopened"
+      fi
+    fi
+    if [[ "$(signature "$wt" "$state")" == "$before" ]]; then stall=$((stall + 1)); else stall=0; fi
+    if (( stall >= FORGE_STALL_LIMIT )); then
+      if (( escalated )); then block "$s" "stalled: $stall iterations with no commit and no state change, after escalating to $model"; return; fi
+      escalated=1; stall=0; model="$FORGE_MODEL_ESCALATE"
+      ledger "slice $s: stalled, escalating to $model"; log "slice #$s: stalled; escalating to $model"
+    fi
+  done
+  block "$s" "iteration budget spent ($FORGE_MAX_ITERATIONS) without passing the gate"
+}
+
+# ----------------------------------------------------------------- merge ----
+
+merge_slice() { # <slice>: bring a done slice onto the integration branch, or park it
+  local s="$1" dir="$RUN/slices/$1" br="forge/$SPEC/slice-$1" pre title fail
+  title="$(title_of "$dir/ticket.md")"
+  pre="$(git -C "$INT" rev-parse HEAD)"
+  local -a vars=("SLICE=$s" "TICKET=$dir/ticket.md" "STATE=$dir/state.md" "SPEC=$RUN/spec.md"
+                 "VERIFY_CMD=$(gate_text "$INT")" "NOTES=$dir/merge-notes.md" "GATE_LOG=$dir/integration-gate.log")
+  if ! git -C "$INT" merge --no-ff -m "Merge slice #$s: $title" "$br" > "$dir/merge.log" 2>&1; then
+    log "slice #$s: merge conflict; dispatching a resolver"
+    render "$FORGE_HOME/prompts/merge.md" "${vars[@]}" | agent "$INT" "$FORGE_MODEL_IMPLEMENT" "$dir/merge-agent.log"
+    fail="$(agent_failure "$dir/merge-agent.log")"
+    if [[ -n "$fail" ]]; then   # the slice stays "done" and is merged on the next run
+      git -C "$INT" merge --abort 2>/dev/null || true; git -C "$INT" reset -q --hard "$pre"
+      halt "$fail while resolving the merge of slice #$s"; return
+    fi
+    if git -C "$INT" rev-parse -q --verify MERGE_HEAD >/dev/null || [[ -n "$(git -C "$INT" status --porcelain)" ]]; then
+      git -C "$INT" merge --abort 2>/dev/null || true; git -C "$INT" reset -q --hard "$pre"
+      block "$s" "merge conflict left unresolved (see $dir/merge-notes.md)"; return
+    fi
+  fi
+  if ! int_gate "$dir/integration-gate.log"; then
+    log "slice #$s: integration gate red after merge; dispatching a fix"
+    render "$FORGE_HOME/prompts/integrate-fix.md" "${vars[@]}" | agent "$INT" "$FORGE_MODEL_ESCALATE" "$dir/integrate-agent.log"
+    fail="$(agent_failure "$dir/integrate-agent.log")"
+    if [[ -n "$fail" ]]; then
+      git -C "$INT" reset -q --hard "$pre"; git -C "$INT" clean -qfd
+      halt "$fail while fixing the integration of slice #$s"; return
+    fi
+    if [[ -n "$(git -C "$INT" status --porcelain)" ]] || ! int_gate "$dir/integration-gate.log"; then
+      git -C "$INT" reset -q --hard "$pre"; git -C "$INT" clean -qfd
+      block "$s" "integration gate red after merge; merge undone (see $dir/integration-gate.log)"; return
+    fi
+  fi
+  set_status "$s" merged
+  ledger "slice $s: merged at $(git -C "$INT" rev-parse --short HEAD)"
+  log "slice #$s: merged"
+  git -C "$REPO" worktree remove --force "$WT/slice-$s" 2>/dev/null || true
+  publish_progress "$s"
+}
+
+# -------------------------------------------------------------- GitHub ------
+
+closes_lines() {
+  local s
+  [[ " ${SLICES[*]} " == *" $SPEC "* ]] || echo "Closes #$SPEC"
+  for s in "${SLICES[@]}"; do [[ "$(status_of "$s")" == merged ]] && echo "Closes #$s"; done
+  return 0
+}
+
+ensure_pr() { # push the integration branch and make sure its draft PR exists
+  git -C "$INT" push -q -u origin "$INT_BRANCH" || { log "push failed; continuing locally"; return 1; }
+  [[ -s "$RUN/pr" ]] && return 0
+  "$GH" pr create --draft --base "$FORGE_BASE_BRANCH" --head "$INT_BRANCH" \
+    --title "$(title_of "$RUN/spec.md")" \
+    --body "Forge run for #$SPEC in progress. The QA report replaces this text when the run finishes." > "$RUN/pr" \
+    || { log "could not open the draft PR; continuing"; : > "$RUN/pr"; return 1; }
+  [[ -s "$RUN/pr" ]]
+}
+
+publish_progress() { # <slice>: push, make sure the draft PR exists, note it on the issue
+  (( LOCAL )) && return 0
+  ensure_pr || return 0
+  "$GH" issue comment "$1" --body "Merged into \`$INT_BRANCH\` at $(git -C "$INT" rev-parse --short HEAD) by forge." >/dev/null 2>&1 || true
+}
+
+finalize_pr() {
+  (( LOCAL )) && return 0
+  ensure_pr || { log "no PR to update; the report stays at $RUN/qa/report.md"; return 0; }
+  local pr s all_merged=1; pr="$(tail -n1 "$RUN/pr")"
+  for s in "${SLICES[@]}"; do [[ "$(status_of "$s")" == merged ]] || all_merged=0; done
+  { closes_lines; echo; head -c 60000 "$RUN/qa/report.md"; } > "$RUN/qa/pr-body.md"
+  "$GH" pr edit "$pr" --body-file "$RUN/qa/pr-body.md" >/dev/null || log "could not update the PR body"
+  if (( all_merged )); then "$GH" pr ready "$pr" >/dev/null || true; log "PR ready for review: $pr"
+  else log "PR left as draft (unmerged slices): $pr"; fi
+}
+
+# ------------------------------------------------------------ front door ----
+
+# All the GitHub access an interactive session needs, as a few fixed verbs. A
+# sandboxed session is allowed these and nothing wider: no raw gh, no network,
+# no token. They never source .forge/config.sh, so nothing here runs code from
+# a file the session itself can write.
+
+origin_repo() { # origin as [HOST/]OWNER/REPO
+  local url; url="$(git remote get-url origin 2>/dev/null)" || die "no 'origin' remote here (run /forge:setup)"
+  url="${url%/}"; url="${url%.git}"
+  [[ "$url" =~ ^([a-z+]+://)?([^@/]+@)?([^:/]+)(:[0-9]+)?[:/]([^/]+/[^/]+)$ ]] || die "cannot tell the GitHub repository from origin ($url)"
+  if [[ "${BASH_REMATCH[3]}" == github.com ]]; then echo "${BASH_REMATCH[5]}"; else echo "${BASH_REMATCH[3]}/${BASH_REMATCH[5]}"; fi
+}
+
+gh_pin() { # every call goes to origin's repository, and never stops to ask
+  [[ -n "${GH_REPO:-}" ]] || GH_REPO="$(origin_repo)" || exit 1
+  export GH_REPO GH_PROMPT_DISABLED=1
+}
+
+cmd_issue() {
+  local verb="${1:-}" what="${2:-}" title="" body="" labels color
+  shift 2 2>/dev/null || die "usage: forge issue view <n> | create <spec|slice> --title <t> --body-file <f> | edit <n> --body-file <f>"
+  while (( $# )); do
+    case "$1" in
+      --title) title="${2:-}"; shift ;;
+      --body-file) body="${2:-}"; shift ;;
+      *) die "forge issue: unknown argument: $1" ;;
+    esac
+    shift || true
+  done
+  case "$verb" in view|edit) [[ "$what" =~ ^[0-9]+$ ]] || die "forge issue $verb: expected an issue number, got '$what'" ;; esac
+  case "$verb" in create|edit) [[ -s "$body" ]] || die "forge issue $verb: --body-file must name a file that is not empty" ;; esac
+  gh_pin
+  case "$verb" in
+    view)
+      [[ -z "$title$body" ]] || die "forge issue view takes only an issue number"
+      "$GH" issue view "$what" --json number,title,state,labels,body \
+        | jq -r '"# \(.title)\n\nIssue: #\(.number) · \(.state) · \([.labels[].name] | join(", "))\n\n\(.body)"' \
+        || die "cannot read issue #$what (run: forge doctor)" ;;
+    create)
+      case "$what" in spec) color=5319E7 ;; slice) color=0E8A16 ;; *) die "forge issue create: expected 'spec' or 'slice', got '$what'" ;; esac
+      [[ -n "$title" ]] || die "forge issue create: --title is required"
+      "$GH" label create "forge:$what" --description "A Forge $what" --color "$color" >/dev/null 2>&1 || true   # it already exists
+      "$GH" issue create --title "$title" --label "forge:$what" --body-file "$body" ;;
+    edit)
+      [[ -z "$title" ]] || die "forge issue edit changes the body only"
+      labels="$("$GH" issue view "$what" --json labels -q '.labels[].name')" || die "cannot read issue #$what (run: forge doctor)"
+      grep -qxE 'forge:(spec|slice)' <<< "$labels" || die "issue #$what is not a Forge spec or slice; forge will not edit it"
+      "$GH" issue edit "$what" --body-file "$body" ;;
+    *) die "unknown command: issue $verb" ;;
+  esac
+}
+
+cmd_pr() {
+  local verb="${1:-}" spec="${2:-}" br
+  [[ $# -eq 2 && "$spec" =~ ^[0-9]+$ ]] || die "usage: forge pr view <spec> | push <spec>"
+  br="forge/$spec/integration"
+  gh_pin
+  case "$verb" in
+    view)
+      "$GH" pr view "$br" --json number,title,state,isDraft,url,baseRefName,additions,deletions,changedFiles,files \
+        | jq -r '"PR #\(.number): \(.title)\n\(.url)\n\(.state)\(if .isDraft then " (draft)" else "" end) · into \(.baseRefName) · \(.changedFiles) file(s), +\(.additions) -\(.deletions)\n",
+                 (.files[] | "  +\(.additions)\t-\(.deletions)\t\(.path)")' \
+        || die "no PR found for $br (run: forge doctor)" ;;
+    push)
+      git show-ref --verify --quiet "refs/heads/$br" || die "no branch $br here"
+      git push -q -u origin "$br" && log "pushed $br" ;;
+    *) die "unknown command: pr $verb" ;;
+  esac
+}
+
+cmd_doctor() {
+  local c bad=0 repo
+  for c in git jq "$GH" "$CLAUDE"; do
+    if command -v "$c" >/dev/null 2>&1; then echo "ok       $c"; else echo "MISSING  $c"; bad=1; fi
+  done
+  echo "ok       bash $BASH_VERSION"
+  if "$GH" auth status >/dev/null 2>&1; then echo "ok       GitHub login"
+  else
+    echo "FAIL     GitHub login: not logged in (gh auth login), or GitHub is unreachable."
+    echo "         In a sandboxed session that means forge is running inside the sandbox: see \"Sandboxed sessions\" in the README."
+    bad=1
+  fi
+  if repo="$(origin_repo 2>/dev/null)"; then echo "ok       origin: $repo"; else echo "note     no GitHub 'origin' remote here yet"; fi
+  return "$bad"
+}
+
+# -------------------------------------------------------------------- QA ----
+
+count_open() { { grep -cE "$1" "$2" || true; }; }
+
+qa_inputs() { # the prompt every reviewer gets: paths only
+  cat <<EOF
+Audit the branch checked out in this directory.
+
+- Spec: $RUN/spec.md
+- Slice tickets: $RUN/qa/slices.md
+- Diff (commit list, stat, full diff with context): $RUN/qa/diff.patch
+- Gate log ($1): $RUN/qa/gate.log
+- Constitution: $CONSTITUTION
+- Lens directory: $FORGE_HOME/skills/qa/lenses
+EOF
+}
+
+# The audit could not complete. Say so; never let silence read as "clean".
+qa_pause() { # <reason>
+  halt "$1"
+  printf '# Forge report: #%s\n\n**AUDIT INCOMPLETE.** %s.\n\nNo conclusion can be drawn about this branch from this report. Re-run the audit with `forge qa %s`.\n' \
+    "$SPEC" "$1" "$SPEC" > "$RUN/qa/report.md"
+  log "the audit did not complete, and the PR was left as it was. Resume with: forge qa $SPEC"
+  exit 75
+}
+
+cmd_qa() {
+  local base gate_verdict=PASS r open findings s why
+  git -C "$REPO" show-ref --verify --quiet "refs/heads/$INT_BRANCH" || die "no integration branch for #$SPEC (nothing has run yet)"
+  ensure_integration
+  base="$(git -C "$INT" merge-base "$FORGE_BASE_BRANCH" HEAD)"
+  [[ "$base" != "$(git -C "$INT" rev-parse HEAD)" ]] || { log "QA: the integration branch has no commits; nothing to audit"; return 0; }
+  log "QA: packaging the branch"
+  { git -C "$INT" log --oneline "$base..HEAD"; echo; git -C "$INT" diff --stat "$base..HEAD"; echo
+    git -C "$INT" diff -U10 "$base..HEAD"; } > "$RUN/qa/diff.patch"
+  : > "$RUN/qa/slices.md"
+  for s in "${SLICES[@]}"; do { cat "$RUN/slices/$s/ticket.md"; printf '\n\n---\n\n'; } >> "$RUN/qa/slices.md"; done
+  gate "$INT" "$RUN/qa/gate.log" || gate_verdict=FAIL
+
+  usage_check; halted && qa_pause "$(cat "$RUN/halt")"
+  log "QA: three reviewers in parallel ($FORGE_MODEL_QA)"
+  qa_inputs "$gate_verdict" | reviewer qa-spec  "$FORGE_MODEL_QA" "$RUN/qa/spec-axis.md" &
+  qa_inputs "$gate_verdict" | reviewer qa-tests "$FORGE_MODEL_QA" "$RUN/qa/tests-axis.md" &
+  qa_inputs "$gate_verdict" | reviewer qa-code  "$FORGE_MODEL_QA" "$RUN/qa/code-axis.md" &
+  wait
+  for s in spec tests code; do
+    why="$(reviewer_failure "$RUN/qa/$s-axis.md" '^### Findings')"
+    [[ -z "$why" ]] || qa_pause "The $s reviewer produced no report: $why"
+  done
+
+  findings="$RUN/qa/open-0.md"
+  { grep -hE '^- \[(BLOCKER|IMPORTANT|MINOR)\]' "$RUN/qa/spec-axis.md" "$RUN/qa/tests-axis.md" "$RUN/qa/code-axis.md" || true; } > "$findings"
+  [[ "$gate_verdict" == FAIL ]] && echo "- [BLOCKER] gate — the verify command fails on the integration branch — see $RUN/qa/gate.log — make it pass" >> "$findings"
+  open="$(count_open '^- \[(BLOCKER|IMPORTANT)\]' "$findings")"
+  rm -f "$RUN"/qa/fix-*.md "$RUN"/qa/fix-*.patch "$RUN"/qa/recheck-*.md "$RUN"/qa/parked.md
+
+  r=0
+  while (( open > 0 && r < FORGE_QA_MAX_ROUNDS )); do
+    usage_check; halted && qa_pause "$(cat "$RUN/halt")"
+    r=$((r + 1)); local fixbase; fixbase="$(git -C "$INT" rev-parse HEAD)"
+    log "QA: $open blocking finding(s); fix round $r/$FORGE_QA_MAX_ROUNDS"
+    render "$FORGE_HOME/prompts/qa-fix.md" "CONSTITUTION=$CONSTITUTION" "FINDINGS=$findings" "SPEC=$RUN/spec.md" \
+        "SLICES=$RUN/qa/slices.md" "VERIFY_CMD=$(gate_text "$INT")" "NOTES=$RUN/qa/fix-$r.md" "ROUND=$r" \
+      | agent "$INT" "$FORGE_MODEL_ESCALATE" "$RUN/qa/fix-agent-$r.log"
+    why="$(agent_failure "$RUN/qa/fix-agent-$r.log")"
+    [[ -z "$why" ]] || qa_pause "Fix round $r did not run: $why"
+    [[ -f "$RUN/qa/fix-$r.md" ]] || echo "(the fixer wrote no notes)" > "$RUN/qa/fix-$r.md"
+    gate_verdict=PASS; int_gate "$RUN/qa/gate.log" || gate_verdict=FAIL
+    git -C "$INT" diff -U10 "$fixbase..HEAD" > "$RUN/qa/fix-$r.patch"
+    cat <<EOF | reviewer qa-recheck "$FORGE_MODEL_QA" "$RUN/qa/recheck-$r.md"
+Re-review fix round $r.
+
+- Findings that were open: $findings
+- Fix notes: $RUN/qa/fix-$r.md
+- Fix diff: $RUN/qa/fix-$r.patch
+- Spec: $RUN/spec.md
+- Gate log after the fixes ($gate_verdict): $RUN/qa/gate.log
+EOF
+    why="$(reviewer_failure "$RUN/qa/recheck-$r.md" '^- \[(ADDRESSED|OPEN|PARKED|NEW)\]')"
+    [[ -z "$why" ]] || qa_pause "The recheck of fix round $r produced no report: $why"
+    { grep -hE '^- \[PARKED\]' "$RUN/qa/recheck-$r.md" || true; } >> "$RUN/qa/parked.md"
+    findings="$RUN/qa/open-$r.md"
+    { grep -hE '^- \[(OPEN|NEW)\]' "$RUN/qa/recheck-$r.md" || true; } | sed -E 's/^- \[(OPEN|NEW)\] /- /' > "$findings"
+    { grep -hE '^- \[MINOR\]' "$RUN/qa/open-0.md" || true; } >> "$findings"
+    [[ "$gate_verdict" == FAIL ]] && echo "- [BLOCKER] gate — the verify command still fails after fix round $r — see $RUN/qa/gate.log" >> "$findings"
+    open="$(count_open '^- \[(BLOCKER|IMPORTANT)\]' "$findings")"
+  done
+
+  write_report "$gate_verdict" "$findings" "$r" "$open"
+  ledger "qa: finished after $r fix round(s), $open blocking finding(s) open, gate $gate_verdict"
+  log "QA: report at $RUN/qa/report.md ($open blocking finding(s) open, gate $gate_verdict)"
+  finalize_pr
+}
+
+# The report is a brief: what needs the human's decision first, evidence after.
+write_report() { # <gate verdict> <open findings file> <rounds> <open count>
+  local s any f
+  {
+    echo "# Forge report: #$SPEC $(title_of "$RUN/spec.md")"
+    echo
+    echo "Branch \`$INT_BRANCH\` · $(git -C "$INT" rev-list --count "$(git -C "$INT" merge-base "$FORGE_BASE_BRANCH" HEAD)..HEAD") commits · gate **$1** · $3 fix round(s) · **$4** blocking finding(s) open"
+    echo
+    echo "## Needs your decision"
+    echo
+    echo "### Slices that did not merge"
+    any=0
+    for s in "${SLICES[@]}"; do
+      case "$(status_of "$s")" in
+        merged) ;;
+        blocked) any=1; echo "- #$s $(title_of "$RUN/slices/$s/ticket.md"): $(cat "$RUN/slices/$s/blocked-reason" 2>/dev/null)" ;;
+        *) any=1; echo "- #$s $(title_of "$RUN/slices/$s/ticket.md"): not started (a blocker did not merge)" ;;
+      esac
+    done
+    (( any )) || echo "- none"
+    echo
+    echo "### Findings still open"
+    { grep -E '^- \[(BLOCKER|IMPORTANT)\]' "$2" || echo "- none"; }
+    echo
+    echo "### Findings the fixer declined (parked for you)"
+    if [[ -s "$RUN/qa/parked.md" ]]; then cat "$RUN/qa/parked.md"; else echo "- none"; fi
+    echo
+    echo "### Rulings: decisions the agents made on your behalf"
+    { grep -hE '^- Ruling:' "$RUN"/slices/*/state.md "$RUN"/qa/fix-*.md 2>/dev/null || echo "- none"; }
+    echo
+    echo "### Minor findings (not fixed)"
+    { grep -E '^- \[MINOR\]' "$2" || echo "- none"; }
+    echo
+    echo "### Deferred by implementers (out of scope, not fixed)"
+    any=0
+    for s in "${SLICES[@]}"; do
+      f="$(section "$RUN/slices/$s/state.md" "Deferred" 2>/dev/null | sed '/<!--/,/-->/d' | grep -v '^[[:space:]]*$' || true)"
+      [[ -n "$f" ]] && { any=1; printf '%s\n' "$f"; }
+    done
+    (( any )) || echo "- none"
+    echo
+    echo "## Audit"
+    echo
+    for f in spec tests code; do
+      echo "### ${f^} axis"; echo; cat "$RUN/qa/$f-axis.md" 2>/dev/null || echo "(no report)"; echo
+    done
+    for f in "$RUN"/qa/recheck-*.md; do
+      [[ -f "$f" ]] || continue
+      echo "### Fix round $(basename "$f" .md | cut -d- -f2)"; echo
+      echo "Fix notes:"; echo; cat "${f/recheck-/fix-}" 2>/dev/null; echo; echo "Recheck:"; echo; cat "$f"; echo
+    done
+  } > "$RUN/qa/report.md"
+}
+
+# ------------------------------------------------------------- commands -----
+
+preflight() {
+  local c
+  for c in git jq "$GH" "$CLAUDE"; do command -v "$c" >/dev/null 2>&1 || die "missing dependency: $c"; done
+  [[ -f "$CONSTITUTION" ]] || die "no .forge/constitution.md (run /forge:setup)"
+  git -C "$REPO" show-ref --verify --quiet "refs/heads/$FORGE_BASE_BRANCH" || die "base branch '$FORGE_BASE_BRANCH' not found"
+}
+
+# The integration worktree: where slices merge and QA runs. Your own checkout
+# is never touched. A brand-new integration branch must pass the gate before
+# any slice starts, or every slice would inherit a red baseline.
+ensure_integration() {
+  [[ -d "$INT" ]] && return 0
+  local fresh=0 greenfield=0
+  # A new project has nothing to set up or verify until its foundation slice merges.
+  [[ -n "$FOUNDATION" && "$(status_of "$FOUNDATION")" != merged ]] && greenfield=1
+  if git -C "$REPO" show-ref --verify --quiet "refs/heads/$INT_BRANCH"; then
+    git -C "$REPO" worktree add "$INT" "$INT_BRANCH" >/dev/null 2>&1
+  else
+    git -C "$REPO" worktree add -b "$INT_BRANCH" "$INT" "$FORGE_BASE_BRANCH" >/dev/null 2>&1; fresh=1
+  fi
+  local setup; setup="$(cfg "$INT" FORGE_SETUP_CMD)"
+  if [[ -n "$setup" ]] && ! ( cd "$INT" && bash -c "$setup" ) > "$RUN/setup.log" 2>&1; then
+    (( greenfield )) || die "setup command failed in the integration worktree (see $RUN/setup.log)"
+  fi
+  (( fresh )) || return 0
+  log "checking the baseline gate on $FORGE_BASE_BRANCH"
+  gate "$INT" "$RUN/baseline-gate.log" && return 0
+  (( greenfield )) || die "the gate is red before any work (see $RUN/baseline-gate.log). Fix $FORGE_BASE_BRANCH first."
+  log "no passing gate yet: foundation slice #$FOUNDATION builds the project and defines its gate first; everything else waits for it"
+}
+
+cmd_run() {
+  local merged_now=0 running pid s started
+  local -A pid_slice=()
+  preflight
+  mkdir "$RUN/.lock" 2>/dev/null || die "another forge run holds #$SPEC (remove $RUN/.lock if it died)"
+  trap 'rmdir "$RUN/.lock" 2>/dev/null || true' EXIT
+  trap 'log "interrupted; stopping agents"; for pid in $(jobs -p); do kill_tree "$pid"; done; exit 130' INT TERM
+
+  rm -f "$RUN/halt"
+  snapshot_spec
+  log "spec #$SPEC: ${#SLICES[@]} slice(s): ${SLICES[*]}"
+  [[ -n "$FORGE_VERIFY_CMD" || -n "$FOUNDATION" ]] \
+    || die "FORGE_VERIFY_CMD is empty in .forge/config.sh and no slice is marked '## Foundation': the loop has no gate (run /forge:setup)"
+  usage_note
+
+  ensure_integration
+
+  while :; do
+    usage_check
+    if ! halted; then
+      running=${#pid_slice[@]}
+      for s in "${SLICES[@]}"; do
+        (( running < FORGE_MAX_PARALLEL )) || break
+        [[ "$(status_of "$s")" == pending ]] && blockers_merged "$s" && ! overlaps_running "$s" || continue
+        prepare_slice "$s"; set_status "$s" running; ledger "slice $s: started"
+        log "slice #$s: started ($(title_of "$RUN/slices/$s/ticket.md"))"
+        slice_loop "$s" & pid_slice[$!]="$s"; running=$((running + 1))
+      done
+      # Merge every slice that is done and no longer running (including one a
+      # previous, paused run left behind).
+      started=0
+      for s in "${SLICES[@]}"; do
+        halted && break
+        [[ "$(status_of "$s")" == done && -z "$(printf '%s\n' "${pid_slice[@]}" | grep -x "$s" || true)" ]] || continue
+        merge_slice "$s"; [[ "$(status_of "$s")" == merged ]] && merged_now=$((merged_now + 1)); started=1
+      done
+      (( started )) && continue
+    fi
+    (( ${#pid_slice[@]} )) || break
+    pid=""; wait -n -p pid || true
+    [[ -n "$pid" ]] || continue
+    s="${pid_slice[$pid]}"; unset "pid_slice[$pid]"
+    if [[ "$(status_of "$s")" == running ]]; then
+      if halted; then set_status "$s" pending; else block "$s" "the slice loop exited unexpectedly (see $RUN/slices/$s)"; fi
+    fi
+  done
+
+  cmd_status
+  if halted; then
+    log "paused: $(cat "$RUN/halt")"
+    log "nothing is lost. Resume with: forge run $SPEC"
+    exit 75
+  fi
+  if (( SKIP_QA )); then log "QA skipped (--skip-qa)"; return 0; fi
+  if (( merged_now == 0 )) && [[ -f "$RUN/qa/report.md" ]]; then log "nothing new merged; the existing QA report stands"; return 0; fi
+  cmd_qa
+}
+
+cmd_status() {
+  local s st
+  [[ -n "${SLICES+x}" ]] || { [[ -f "$RUN/spec.md" ]] || die "no run state for #$SPEC"; mapfile -t SLICES < <(section "$RUN/spec.md" "Slices" | refs); (( ${#SLICES[@]} )) || SLICES=("$SPEC"); }
+  printf '\n%-8s %-10s %s\n' SLICE STATUS DETAIL
+  for s in "${SLICES[@]}"; do
+    st="$(status_of "$s")"
+    case "$st" in
+      blocked) printf '%-8s %-10s %s\n' "#$s" "$st" "$(cat "$RUN/slices/$s/blocked-reason" 2>/dev/null)" ;;
+      pending) if blockers_merged "$s"; then printf '%-8s %-10s %s\n' "#$s" "$st" "on the frontier"
+               else printf '%-8s %-10s %s\n' "#$s" "$st" "waiting on: $(tr '\n' ' ' < "$RUN/slices/$s/blocked-by")"; fi ;;
+      *) printf '%-8s %-10s %s\n' "#$s" "$st" "$(title_of "$RUN/slices/$s/ticket.md")" ;;
+    esac
+  done
+  [[ -f "$RUN/halt" ]] && printf '\nPaused: %s\n' "$(cat "$RUN/halt")"
+  echo
+}
+
+cmd_unblock() {
+  local s="$1" dir="$RUN/slices/$1"
+  [[ "$(status_of "$s")" == blocked ]] || die "slice #$s is not blocked (status: $(status_of "$s"))"
+  set_status "$s" pending; rm -f "$dir/blocked-reason"
+  [[ -f "$dir/state.md" ]] && set_state_status "$dir/state.md" in-progress
+  ledger "slice $s: unblocked by hand"
+  log "slice #$s is pending again. Edit $dir/state.md to give the next iteration direction, then: forge run $SPEC"
+}
+
+cmd_clean() {
+  local d
+  for d in "$WT"/*/; do [[ -d "$d" ]] && git -C "$REPO" worktree remove --force "$d" && log "removed ${d%/}"; done
+  git -C "$REPO" worktree prune
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in ""|-h|--help|help) usage; exit 0 ;; esac
+  case "$cmd" in
+    issue) cmd_issue "$@"; exit ;;
+    pr) cmd_pr "$@"; exit ;;
+    doctor) cmd_doctor; exit ;;
+  esac
+  load_config
+  local logfile=""
+  local -a pos=()
+  while (( $# )); do
+    case "$1" in
+      --yolo) YOLO=1 ;;
+      --local) LOCAL=1 ;;
+      --skip-qa) SKIP_QA=1 ;;
+      --max-parallel) shift; FORGE_MAX_PARALLEL="${1:?--max-parallel needs a number}" ;;
+      --log) shift; logfile="${1:?--log needs a file}" ;;
+      -*) die "unknown option: $1" ;;
+      *) pos+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#pos[@]} )) || die "missing spec issue number"
+  init_spec "${pos[0]}"
+  [[ -z "$logfile" ]] || exec > "$logfile" 2>&1
+  case "$cmd" in
+    run) cmd_run ;;
+    qa) preflight; rm -f "$RUN/halt"; snapshot_spec; cmd_qa ;;
+    status) cmd_status ;;
+    unblock) cmd_unblock "${pos[1]:?usage: forge unblock <spec> <slice>}" ;;
+    clean) cmd_clean ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
