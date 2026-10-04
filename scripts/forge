@@ -14,7 +14,8 @@
 #   forge issue edit <n> --body-file <f>   replace the body of a spec or slice
 #   forge pr view <spec>          the run's PR and the files it changes
 #   forge pr push <spec>          push the integration branch
-#   forge doctor                  check the tools, the GitHub login, the remote
+#   forge doctor                  check the tools, the GitHub login, the remote,
+#                                 and what a run's agents can reach
 #
 # Exit status 75 means the run paused itself at a safe point (usage limit, or a
 # failed agent call). Nothing is lost: run the same command again to resume.
@@ -410,6 +411,12 @@ slice_loop() { # <slice>: runs in the background; its verdict is the status file
     ( cd "$wt" && bash -c "$setup" ) > "$dir/setup.log" 2>&1 || { block "$s" "setup command failed (see $dir/setup.log)"; return; }
     touch "$dir/setup-done"
   fi
+  # An agent that cannot write its state file loses every iteration to it.
+  # Ask the hooks before the first one, and leave the reason with the slice.
+  local refused; refused="$(edit_hook_refusals "$wt" "$wt" "$state")"; refused="${refused%%$'\n'*}"
+  if [[ -n "$refused" ]]; then
+    block "$s" "an edit hook refuses the slice's state file, so no iteration was run: ${refused%%$'\t'*} said \"${refused#*$'\t'}\". See \"What a run can reach\" in the README, then: forge unblock $SPEC $s"; return
+  fi
   local fail
   while (( i < FORGE_MAX_ITERATIONS )); do
     usage_check
@@ -601,8 +608,70 @@ cmd_pr() {
   esac
 }
 
+# ------------------------------------------------------------------ reach ----
+# What an agent can reach is its own worktree and its run directory. Two things
+# in the user's settings can take that away without the run knowing; both are
+# read here and neither is changed.
+
+# settings_files <repo>: the settings a headless agent in a worktree reads:
+# yours, and the project's committed ones (a worktree is a checkout, so it
+# carries no settings.local.json).
+settings_files() {
+  local f
+  for f in "$HOME/.claude/settings.json" "$1/.claude/settings.json"; do [[ -f "$f" ]] && echo "$f"; done
+  return 0
+}
+
+# missing_write_paths <repo>: the sandbox.filesystem.allowWrite entries that
+# do not exist. The sandbox can only open a path that is there, so a missing
+# one stays read-only and the agent cannot create it either. Entries relative
+# to the project and glob entries are not checked.
+missing_write_paths() {
+  local f p
+  while IFS= read -r f; do
+    while IFS= read -r p; do
+      case "$p" in
+        *[*?[]*) continue ;;
+        "~/"*) p="$HOME/${p#"~/"}" ;;
+        //*) p="${p#/}" ;;
+        *) continue ;;
+      esac
+      [[ -e "$p" ]] || echo "$p"
+    done < <(jq -r '.sandbox.filesystem.allowWrite[]? // empty' "$f" 2>/dev/null)
+  done < <(settings_files "$1") | sort -u
+}
+
+# stale_worktrees <repo>: worktrees under .forge/worktrees/ that git still has
+# registered though their directory is gone (a killed run, or an `rm -rf`).
+# git refuses to add a worktree at a path it still has registered.
+stale_worktrees() {
+  git -C "$1" worktree list --porcelain 2>/dev/null \
+    | awk -v pre="$1/.forge/worktrees/" '/^worktree /{p = substr($0, 10)} /^prunable/ && index(p, pre) == 1 {print p}'
+}
+
+# edit_hook_refusals <checkout> <project dir> <file>: every PreToolUse hook
+# that sees a Write, in your settings and the checkout's, is given a write to
+# <file> with <project dir> as the project directory, which must exist. Prints
+# "<hook command><TAB><what it said>" for each one that refuses.
+edit_hook_refusals() {
+  local f cmd input out rc
+  input="$(jq -nc --arg p "$3" --arg d "$2" \
+    '{hook_event_name: "PreToolUse", tool_name: "Write", cwd: $d, tool_input: {file_path: $p, content: ""}}')"
+  while IFS= read -r f; do
+    while IFS= read -r cmd; do
+      rc=0; out="$(cd "$2" && printf '%s' "$input" | CLAUDE_PROJECT_DIR="$2" timeout 10 bash -c "$cmd" 2>&1)" || rc=$?
+      if (( rc == 2 )) || grep -Eq '"(permissionDecision|decision)"[[:space:]]*:[[:space:]]*"(deny|block)"' <<<"$out"; then
+        printf '%s\t%s\n' "$cmd" "$(head -n1 <<<"$out")"
+      fi
+    done < <(jq -r '.hooks.PreToolUse[]?
+        | select((.matcher // "") as $m | $m == "" or $m == "*" or ("Write" | test("^(" + $m + ")$")))
+        | .hooks[]? | select((.type // "command") == "command") | .command // empty' "$f" 2>/dev/null)
+  done < <(settings_files "$1")
+}
+
 cmd_doctor() {
-  local c bad=0 repo
+  local c bad=0 repo root line
+  local -a missing
   for c in git jq "$GH" "$CLAUDE"; do
     if command -v "$c" >/dev/null 2>&1; then echo "ok       $c"; else echo "MISSING  $c"; bad=1; fi
   done
@@ -614,6 +683,32 @@ cmd_doctor() {
     bad=1
   fi
   if repo="$(origin_repo 2>/dev/null)"; then echo "ok       origin: $repo"; else echo "note     no GitHub 'origin' remote here yet"; fi
+  command -v jq >/dev/null 2>&1 && root="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd)" || return "$bad"
+  mapfile -t missing < <(missing_write_paths "$root")
+  if (( ${#missing[@]} )); then
+    echo "FAIL     sandbox: ${#missing[@]} allowWrite path(s) do not exist, so agents cannot write to them. From your own terminal:"
+    echo "         mkdir -p$(printf ' %q' "${missing[@]}")"
+    bad=1
+  else echo "ok       sandbox: every allowWrite path exists"; fi
+  [[ -d "$root/.forge" ]] || return "$bad"
+  mapfile -t missing < <(stale_worktrees "$root")
+  if (( ${#missing[@]} )); then
+    echo "FAIL     worktrees: git still has ${#missing[@]} forge worktree(s) registered whose directory is gone, so a run cannot recreate them:"
+    for line in "${missing[@]}"; do echo "         ${line#"$root"/}"; done
+    echo "         From your own terminal, in the repo: git worktree prune"
+    echo "         Their forge/<spec>/... branches are kept and a run resumes from them; delete a branch to start it again from the base branch."
+    bad=1
+  else echo "ok       worktrees: no stale forge worktree is registered"; fi
+  # The edit a slice agent makes each iteration: its state file, from a worktree.
+  mkdir -p "$root/.forge/worktrees/0/doctor" 2>/dev/null || return "$bad"
+  mapfile -t missing < <(edit_hook_refusals "$root" "$root/.forge/worktrees/0/doctor" "$root/.forge/runs/0/slices/0/state.md")
+  rmdir "$root/.forge/worktrees/0/doctor" "$root/.forge/worktrees/0" 2>/dev/null || true
+  if (( ${#missing[@]} )); then
+    echo "FAIL     edit hooks: an agent in a worktree cannot write its state file in .forge/runs/<spec>/:"
+    for line in "${missing[@]}"; do echo "         ${line%%$'\t'*}: ${line#*$'\t'}"; done
+    echo "         See \"What a run can reach\" in the README."
+    bad=1
+  else echo "ok       edit hooks: an agent in a worktree can write its run directory"; fi
   return "$bad"
 }
 
@@ -802,6 +897,11 @@ preflight() {
   for c in git jq "$GH" "$CLAUDE"; do command -v "$c" >/dev/null 2>&1 || die "missing dependency: $c"; done
   [[ -f "$CONSTITUTION" ]] || die "no .forge/constitution.md (run /forge:setup)"
   git -C "$REPO" show-ref --verify --quiet "refs/heads/$FORGE_BASE_BRANCH" || die "base branch '$FORGE_BASE_BRANCH' not found"
+  local -a missing
+  mapfile -t missing < <(stale_worktrees "$REPO")
+  (( ! ${#missing[@]} )) || die "git still has ${#missing[@]} forge worktree(s) registered whose directory is gone (${missing[*]#"$REPO"/}), so they cannot be recreated. From your own terminal, in the repo: git worktree prune"
+  mapfile -t missing < <(missing_write_paths "$REPO")
+  (( ! ${#missing[@]} )) || die "sandbox.filesystem.allowWrite names path(s) that do not exist, so agents cannot write to them. From your own terminal: mkdir -p$(printf ' %q' "${missing[@]}")"
 }
 
 # The integration worktree: where slices merge and QA runs. Your own checkout

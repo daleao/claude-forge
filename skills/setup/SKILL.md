@@ -34,6 +34,8 @@ bash <plugin root>/install.sh .
 
 It creates `.forge/config.sh`, `.forge/constitution.md` and `.forge/.gitignore` where they don't exist, and links the `forge` and `forge-usage-statusline` commands into `~/.local/bin`. If it reports that the directory is not on the PATH, put that under **needs you** with the line to add to the user's shell profile, and offer to add it.
 
+It also adds Forge's entries to the user's `~/.claude/settings.json` and copies the `workspace-only.sh` hook to `~/.claude/hooks/`, adding only what is missing and keeping a backup. Report each line it prints under that heading. A sandboxed session cannot write there, and the installer says so with a `FAILED` line: put that under **needs you** with the exact command for the user to run from their own terminal, `bash <plugin root>/install.sh <this repo>`, and tell them the settings take effect in a new session.
+
 ## 4. Fill in the two project settings
 
 `.forge/config.sh` has two settings that depend on the project. Everything else in it already has a working default; leave those alone unless the user asks.
@@ -60,7 +62,9 @@ forge doctor
 
 Run it alone: no pipe, no redirect, no `cd` in the same call. Record a clean result under **done for you**.
 
-**If the session uses the Bash sandbox**, `forge doctor` reports the GitHub login as failing until those commands are allowed to run outside the sandbox. The settings for that are in `<plugin root>/templates/sandbox-settings.json`: they take only the GitHub commands and the launch of a run out of the sandbox, ask before each one that writes, and stop sandboxed commands reading the `gh` token. Read the user's `~/.claude/settings.json`, show them what would be merged in, and merge it on a yes. This is their personal settings file; if they decline, put it under **needs you**. If `forge doctor` still fails afterwards, the settings take effect in a new session.
+**If the session uses the Bash sandbox**, `forge doctor` reports the GitHub login as failing until those commands are allowed to run outside the sandbox. The settings for that are the ones the installer adds in step 3 (`<plugin root>/templates/sandbox-settings.json`): they take only the GitHub commands and the launch of a run out of the sandbox, ask before each one that writes, and stop sandboxed commands reading the `gh` token. If step 3 could not write them, this stays under **needs you** with that step's command. If `forge doctor` still fails after they are in, the settings take effect in a new session.
+
+A `FAIL` on the `sandbox` or `edit hooks` line goes under **needs you** with the line `forge doctor` printed.
 
 A login that fails outside a sandbox goes under **needs you** with `gh auth login`.
 
@@ -83,12 +87,13 @@ The config already pauses a run when subscription usage reaches 90% (`FORGE_USAG
 "statusLine": { "type": "command", "command": "forge-usage-statusline" }
 ```
 
-Read that file first.
+The installer adds it in step 3 when the user has no `statusLine`. Read that file to see which case this is.
 
-- No `statusLine` entry: offer to add this one.
-- An existing `statusLine`: leave it. Offer to add the one-line `--record-only` call (shown in the header of `scripts/usage-statusline.sh`) to the user's own status line script.
+- The entry is `forge-usage-statusline`: nothing to do.
+- A different `statusLine`: leave it. Offer to add the one-line `--record-only` call (shown in the header of `scripts/usage-statusline.sh`) to the user's own status line script; that script is theirs, so change it only on a yes, and if they decline put it under **needs you** as optional.
+- No entry, because step 3 could not write the settings: it comes with that step's command.
 
-This is the user's personal settings file, so change it only on a yes. If they decline, put it under **needs you** as optional. Either way, tell them the limits: readings exist only on Pro and Max plans, they update only while an interactive session is active, and a run that reaches the limit pauses cleanly and resumes regardless.
+Either way, tell them the limits: readings exist only on Pro and Max plans, they update only while an interactive session is active, and a run that reaches the limit pauses cleanly and resumes regardless.
 
 ## 8. Report, then offer to finish
 

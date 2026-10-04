@@ -1,4 +1,12 @@
 {
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [{ "type": "command", "command": "~/.claude/hooks/workspace-only.sh" }]
+      }
+    ]
+  },
   "sandbox": {
     "excludedCommands": [
       "forge issue *",
