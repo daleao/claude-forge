@@ -34,8 +34,11 @@ Add `--yolo` only if the user asked for it. Tell the user how to watch it:
 - `forge status <spec>`: each slice's status, and what blocks the parked ones
 - `tail -f .forge/runs/<spec>.log`: the scheduler's log
 - `.forge/runs/<spec>/slices/<n>/state.md`: one slice's memory, live
+- `.forge/runs/<spec>/cleanup-registry.md`: what the run has left on the machine so far (containers, caches, temp files), recorded by each agent before it creates the thing
 
-The run ends on its own with a QA report and, unless `--local`, a PR. The next step is `/forge:review <spec>`.
+The run ends on its own with a QA report, a cleanup pass and, unless `--local`, a PR. The cleanup pass removes what is safe to remove and lists the rest in `.forge/runs/<spec>/cleanup-manual.md`. The next step is `/forge:review <spec>`, which starts with that list.
+
+A run that paused, failed or was interrupted has had no cleanup pass. What it started is reused when it resumes; to stop it instead, `forge cleanup <spec>`.
 
 ## If the run pauses
 

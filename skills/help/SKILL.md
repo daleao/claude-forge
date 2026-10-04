@@ -36,6 +36,7 @@ If `forge run` stops with `paused:` (exit status 75), it hit a usage limit or a 
 
 - **`/forge:retro <spec>`**: after a run, turn its stalls, rulings and QA findings into changes to the agents' environment: checks, standards, slicing habits.
 - **`/forge:architecture-survey`**: upkeep. Surveys the codebase for deepening opportunities and hands you candidates; picking one gives you an idea for step 1.
+- **`/forge:cleanup <spec>`**: after a run, go through what it left on your machine that the cleanup pass would not remove on its own, one step at a time.
 - **`/forge:qa <fixed point>`**: the QA audit by hand, on any branch.
 - **`/forge:handoff`**: write a portable summary when work has to travel to another harness, repo, or person.
 - **`/forge:setup`**: once per repo, before the first run.
@@ -58,6 +59,7 @@ Model-invoked references the steps above pull in. Reach for one directly when it
 | Domain language, decisions | `GLOSSARY.md`, `docs/adr/` |
 | Specs and slices | GitHub issues labelled `forge:spec`, `forge:slice` |
 | Run state (ledger, per-slice memory, logs, QA report) | `.forge/runs/<spec>/`, git-ignored |
+| What a run left on the machine, and what is left for you to remove | `.forge/runs/<spec>/cleanup-registry.md`, `cleanup-manual.md` |
 | Worktrees | `.forge/worktrees/<spec>/`, git-ignored |
 | Config (gate command, models, limits) | `.forge/config.sh` |
 

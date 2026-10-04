@@ -48,6 +48,7 @@ FORGE_USAGE_MAX_AGE=900          # seconds before a usage reading is ignored
 FORGE_MODEL_IMPLEMENT="sonnet"   # slice iterations, merge resolution
 FORGE_MODEL_ESCALATE="opus"      # a stalled slice, audit fixes
 FORGE_MODEL_QA="opus"            # the three reviewers and the recheck
+#FORGE_MODEL_CLEANUP="opus"      # the cleanup pass (unset = FORGE_MODEL_QA)
 
 # Context guard thresholds, in tokens: when an iteration is told to finish its
 # increment, and when it is told to checkpoint immediately.
@@ -65,4 +66,19 @@ FORGE_ALLOWED_TOOLS=(
   "Bash(git status:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"
   "Bash(git add:*)" "Bash(git commit:*)" "Bash(git merge:*)" "Bash(git checkout:*)"
   "Bash(git rm:*)" "Bash(git mv:*)" "Bash(git restore:*)" "Bash(mkdir:*)" "Bash(ls:*)"
+)
+
+# What the cleanup pass may run, on top of reading files and `ls`. The pass
+# runs when a run ends: one agent reads the cleanup registry, removes what is
+# safe, and lists the rest in cleanup-manual.md for you. This list is its hard
+# limit, with `--yolo` or without: a removal it is not allowed to run becomes a
+# manual step. It is never given `rm`. The defaults let it look at Docker and
+# at running processes, and stop and remove containers and networks by name.
+# Volumes, images, processes and everything else stay manual unless you add
+# them. Think before adding "Bash(docker compose:*)": `down -v` deletes
+# volumes, and an allowlist entry cannot tell the two apart.
+FORGE_CLEANUP_TOOLS=(
+  "Bash(docker ps:*)" "Bash(docker inspect:*)" "Bash(docker volume ls:*)" "Bash(docker network ls:*)"
+  "Bash(docker stop:*)" "Bash(docker rm:*)" "Bash(docker network rm:*)"
+  "Bash(pgrep:*)"
 )

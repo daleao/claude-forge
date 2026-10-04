@@ -167,6 +167,7 @@ What happens, without you:
 6. **Merge.** A done slice is merged into the integration branch. Conflicts go to a resolver agent; the gate runs again on the merged result, and a red gate gets one fix attempt before the merge is undone.
 7. **QA.** Three reviewers run in parallel, read-only, each from the diff and the spec, none shown the implementers' notes: **spec** (is each criterion really met: exists, substantive, wired), **tests** (would the tests catch the requirements breaking), **code** (standards, design lenses, regressions, safety). Blocking findings go to one fixer, then a scoped recheck, for at most `FORGE_QA_MAX_ROUNDS` rounds.
 8. **PR.** A draft PR is opened at the first merge and updated at the end with the report. It is marked ready when every slice merged.
+9. **Cleanup.** The record of what a run leaves on the machine is written ahead, not recalled. Before an agent creates anything outside its worktree (a container, a volume, a running process, a temp file, a cache, a downloaded browser), it records the intent: what it is about to create, with which command, and how to remove it. The script does the same for its worktrees and setup command. Under that, a hook writes every Bash command an agent runs to a journal before the command runs, so a footprint the agent never recorded can still be found, and a command that cannot be journaled does not run. Both are on disk at once and join one registry, `.forge/runs/42/cleanup-registry.md`, however the agent call ends; a killed run's records are swept in by the next `forge run` or `forge cleanup`. When the run ends, a cleanup agent checks each record against the machine, removes what is safe, and writes its reasoning back to the registry. What it judges unsafe (anything outside `.forge/`, anything shared, data, installed packages) it leaves alone and writes to `.forge/runs/42/cleanup-manual.md`, with what it is, why it was left, and the command to remove it.
 
 **If usage runs out mid-run**, the script pauses instead of failing. A failed agent call (usage limit, network, crash) is told apart from an agent that made no progress: nothing is parked, each running slice stops before its next iteration with its state intact, and the script exits with status 75 and a `paused:` line. An audit that could not finish is reported as **incomplete**, never as clean, and the PR is left as it was. Run `forge run 42` again after the limit resets and it continues where it stopped.
 
@@ -183,6 +184,7 @@ forge status 42               # each slice: status, and what parked or blocks it
 forge unblock 42 57           # after editing slice 57's state.md with your answer
 forge run 42                  # resumes: merged slices are kept
 forge qa 42                   # re-run the QA phase alone
+forge cleanup 42              # run the cleanup pass (a paused or interrupted run has had none)
 ```
 
 ### Step 5: Review (you)
@@ -191,7 +193,9 @@ forge qa 42                   # re-run the QA phase alone
 /forge:review 42
 ```
 
-The agent briefs you from the report, decisions first: slices that didn't merge, findings still open, findings the fixer declined (with both sides), and every ruling. Then the questions no audit answers: is this what you wanted, does it behave right when you use it, are the trade-offs acceptable, would you maintain it.
+The agent starts with what the run left on your machine: what the cleanup pass removed, and the steps it left for you. `/forge:cleanup 42` takes you through those one at a time, checking each item, showing the command, and waiting for your answer before anything is removed.
+
+Then it briefs you from the report, decisions first: slices that didn't merge, findings still open, findings the fixer declined (with both sides), and every ruling. Then the questions no audit answers: is this what you wanted, does it behave right when you use it, are the trade-offs acceptable, would you maintain it.
 
 - Small corrections are made on the spot, test-first.
 - Bigger rework becomes new slices appended to the spec; `forge run 42` builds only those and re-audits.
@@ -211,6 +215,8 @@ The project memory hierarchy, and who reads what:
 | Specs and slices | GitHub issues `forge:spec`, `forge:slice` | humans; snapshotted for agents |
 | Slice state: criteria + evidence, decisions, rulings, next action | `.forge/runs/<spec>/slices/<n>/state.md` | the next iteration of that slice |
 | Run state: ledger, statuses, logs, QA report | `.forge/runs/<spec>/` | the script; you; `/forge:retro` |
+| Cleanup registry: what each agent and the script left on the machine, and the cleanup pass's verdicts | `.forge/runs/<spec>/cleanup-registry.md` | the cleanup pass; you |
+| Manual cleanup: the steps the pass would not take, with instructions | `.forge/runs/<spec>/cleanup-manual.md` | you; `/forge:review`, `/forge:cleanup` |
 | Coding standards (optional) | `CODING_STANDARDS.md` | QA code reviewer only |
 
 `.forge/runs/` and `.forge/worktrees/` are git-ignored. Delete a run directory to forget a run.
@@ -227,9 +233,11 @@ prompts/                     what each headless context is told
   merge.md                     resolve a merge conflict
   integrate-fix.md             gate red after a clean merge
   qa-fix.md                    fix a round of QA findings
+  footprint.md                 added to each of the above: record the intent before creating anything on the host
+  cleanup.md                   the cleanup pass at the end of a run
 agents/                      the QA reviewers (by axis, not persona)
   qa-spec.md  qa-tests.md  qa-code.md  qa-recheck.md
-hooks/                       context guard (PostToolUse)
+hooks/                       context guard (PostToolUse); command journal for the cleanup registry (PreToolUse)
 templates/                   config.sh, constitution.md, state.md, sandbox-settings.json
 skills/
   grill  spec  slice  run  review          the five steps (user-invoked)
@@ -238,7 +246,7 @@ skills/
   codebase-design                          deep-module vocabulary
   qa (+ lenses/)                           the audit by hand; book-derived review lenses
   research  prototype                      detours during discovery
-  retro  architecture-survey  handoff      around the flow
+  retro  cleanup  architecture-survey  handoff   around the flow
   setup (+ NEW-PROJECT.md)  help           once per repo, or from an empty folder; the map
 LICENSE                      MIT, for this project
 licenses/                    MIT licences of the four source projects
@@ -259,6 +267,8 @@ LINEAGE.md                   where each part came from, and why it is the way it
 | `FORGE_STALL_LIMIT` | 2 | no-progress iterations before escalating the model; again before parking |
 | `FORGE_QA_MAX_ROUNDS` | 2 | QA fix-and-recheck rounds |
 | `FORGE_MODEL_IMPLEMENT` / `_ESCALATE` / `_QA` | `sonnet` / `opus` / `opus` | model per role |
+| `FORGE_MODEL_CLEANUP` | same as `FORGE_MODEL_QA` | model for the cleanup pass |
+| `FORGE_CLEANUP_TOOLS` | empty; the config template sets it to: inspect Docker and processes, stop and remove containers and networks | everything the cleanup pass may run besides reading files, `--yolo` or not; a removal outside this list becomes a manual step |
 | `FORGE_USAGE_STOP_PERCENT` | 90 | pause when 5-hour or 7-day usage reaches this percentage; `""` switches it off |
 | `FORGE_USAGE_MAX_AGE` | 900 | seconds before a usage reading is treated as stale and ignored |
 | `FORGE_ALLOWED_TOOLS` | file tools and basic git | what agents may do without `--yolo`; the commands your gate and setup commands start with are added automatically |
@@ -269,6 +279,7 @@ LINEAGE.md                   where each part came from, and why it is the way it
 - **Permissions.** By default agents run with `--permission-mode acceptEdits` plus your allowlist; anything else is denied. QA reviewers get read-only tools. `--yolo` removes all checks and is meant for a container or VM.
 - **Untrusted text.** An unattended agent acts on what it reads. The script feeds agents issue *bodies* only, never comments, and snapshots them once. Run it on specs you or people you trust wrote.
 - **Your checkout.** All work happens in worktrees under `.forge/`. The script only ever pushes the integration branch, and never merges into your base branch; you do that, through the PR.
+- **Cleanup.** The cleanup pass removes things from your machine unattended, so its limits do not rest on its judgement alone. It runs from the run directory, cannot edit code, is never given `rm`, and may run only `FORGE_CLEANUP_TOOLS`, even under `--yolo`. Anything it may not run, and anything outside `.forge/`, shared, holding data or installed, is left for you in `cleanup-manual.md`. The registry has two layers: the agents' intents, and a command journal that does not depend on them. What neither covers is not found: what the gate and setup commands leave when the script runs them, and anything an agent runs with the plugin's hooks not loaded.
 - **Dependencies.** A failed package install parks the slice instead of trying a similar name, since a name that doesn't resolve may be a hallucinated or squatted package.
 
 ## Sandboxed sessions
@@ -288,7 +299,7 @@ They act on the `origin` repository only, take no other flags, and do not read `
 
 The settings are in [`templates/sandbox-settings.json`](templates/sandbox-settings.json); `/forge:setup` offers to merge them into your `~/.claude/settings.json`. They do three things:
 
-- `sandbox.excludedCommands` takes those commands, plus `forge run` and `forge qa` (which start the headless agents and push), out of the sandbox. `forge status`, `unblock` and `clean` stay inside it.
+- `sandbox.excludedCommands` takes those commands, plus `forge run`, `forge qa` and `forge cleanup` (which start the headless agents; the first two also push), out of the sandbox. `forge status`, `unblock` and `clean` stay inside it.
 - `permissions` lets the read-only commands run without a prompt and asks before each one that writes or launches a run.
 - `sandbox.filesystem.denyRead` hides `~/.config/gh` from sandboxed commands. If `gh` keeps its token in your system keyring this changes nothing; it is there for the plain-file case.
 

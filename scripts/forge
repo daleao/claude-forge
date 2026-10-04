@@ -5,6 +5,7 @@
 #   forge qa <spec>       (re)run the autonomous QA phase on the integration branch
 #   forge status <spec>   show every slice's status and the current frontier
 #   forge unblock <spec> <slice>   put a blocked slice back on the frontier
+#   forge cleanup <spec>  (re)run the cleanup pass over what the run left on the machine
 #   forge clean <spec>    remove the spec's worktrees (branches and run state stay)
 #
 # GitHub for interactive sessions: fixed verbs, always against origin.
@@ -42,7 +43,7 @@ GH="${FORGE_GH_BIN:-gh}"
 die() { echo "forge: $*" >&2; exit 1; }
 log() { printf '[forge %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
-usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<'EOF'
+usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; cat <<'EOF'
 
 Options for `run`:
   --yolo             run agents with --dangerously-skip-permissions (sandbox only)
@@ -73,7 +74,7 @@ load_config() {
   git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
   REPO="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
   [[ -f "$REPO/.forge/config.sh" ]] || die "no .forge/config.sh in $REPO (run /forge:setup)"
-  FORGE_ALLOWED_TOOLS=()
+  FORGE_ALLOWED_TOOLS=(); FORGE_CLEANUP_TOOLS=()
   # shellcheck disable=SC1091
   source "$REPO/.forge/config.sh"
   : "${FORGE_VERIFY_CMD:=}" "${FORGE_SETUP_CMD:=}"
@@ -88,6 +89,7 @@ load_config() {
   # Headless contexts load this plugin from disk. If your Claude Code version
   # objects to that alongside an installed copy, set FORGE_NO_PLUGIN_DIR=1.
   PLUGIN_ARGS=(--plugin-dir "$FORGE_HOME"); [[ -z "${FORGE_NO_PLUGIN_DIR:-}" ]] || PLUGIN_ARGS=()
+  : "${FORGE_MODEL_CLEANUP:=$FORGE_MODEL_QA}"
   YOLO=0; LOCAL=0; SKIP_QA=0; FOUNDATION=""
 }
 
@@ -98,6 +100,7 @@ init_spec() {
   WT="$REPO/.forge/worktrees/$SPEC"
   INT="$WT/integration"
   INT_BRANCH="forge/$SPEC/integration"
+  REGISTRY="$RUN/cleanup-registry.md"; MANUAL="$RUN/cleanup-manual.md"
   mkdir -p "$RUN/slices" "$RUN/external" "$RUN/qa"
 }
 
@@ -129,6 +132,29 @@ title_of() { head -n1 "$1" | sed 's/^# //'; }
 status_of() { cat "$RUN/slices/$1/status" 2>/dev/null || echo pending; }
 set_status() { printf '%s\n' "$2" > "$RUN/slices/$1/status"; }
 ledger() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$RUN/ledger.md"; }
+
+# registry <who>: append stdin to the run's cleanup registry as one entry. The
+# registry is the single list of what the run left on the machine; every agent
+# call and the loop itself add to it, and the cleanup pass works from it.
+# Slices write in parallel, so each append takes a lock (given up after 5s:
+# a lost lock must not stop the run).
+registry() {
+  local entry i=0
+  entry="$(printf '\n## %s — %s\n\n' "$(date '+%F %T')" "$1"; cat)"
+  until mkdir "$REGISTRY.lock" 2>/dev/null; do i=$((i + 1)); (( i < 50 )) || break; sleep 0.1; done
+  [[ -s "$REGISTRY" ]] || printf '# Cleanup registry: forge run #%s\n\nWhat the run left on the machine, recorded as it happened. The cleanup pass appends its verdicts.\n' "$SPEC" > "$REGISTRY"
+  printf '%s\n' "$entry" >> "$REGISTRY"
+  rmdir "$REGISTRY.lock" 2>/dev/null || true
+}
+
+# record_worktree <dir> <branch> [<setup command>]: the loop's own footprint,
+# recorded as an intent, before the worktree is made or the command is run.
+record_worktree() {
+  {
+    printf '### Worktree and branch\n- Kind: file\n- Identifier: `%s`, branch `%s`\n- Command:forge (`git worktree add`)\n- Location: workspace\n- Shared: no\n- Remove with: `forge clean %s`, then `git branch -D %s`. Kept until the PR is merged: review needs it.\n' "$1" "$2" "$SPEC" "$2"
+    [[ -z "${3:-}" ]] || printf '\n### Whatever the setup command installed\n- Kind: other\n- Identifier: unknown\n- Command:`%s`, run by forge in `%s` and in every slice worktree\n- Location: unknown. Dependencies inside the worktree go with it; package managers also fill caches outside the workspace.\n- Shared: unknown\n- Remove with: unknown\n' "$3" "$1"
+  } | registry "${1##*/}: forge"
+}
 
 block() { # <slice> <reason>
   set_status "$1" blocked
@@ -249,14 +275,43 @@ perm_args() { # prints one arg per line: the permission flags for a writing agen
 }
 
 # agent <cwd> <model> <logfile> [extra claude args...]: one fresh headless
-# context. The prompt arrives on stdin. Its exit status lands in <logfile>.rc;
+# context. The prompt arrives on stdin, and the footprint instructions (record
+# the intent before creating anything on the host) are added to it. Its exit
+# status lands in <logfile>.rc;
 # the caller judges the work by what is on disk, and the call by agent_failure.
 agent() {
   local cwd="$1" model="$2" out="$3" rc=0; shift 3
   local -a perms; mapfile -t perms < <(perm_args)
-  ( cd "$cwd" && FORGE_LOOP=1 "$CLAUDE" -p --model "$model" "${PLUGIN_ARGS[@]}" \
+  : > "$out.open"   # this call's records are not in the registry yet (see register)
+  ( cd "$cwd" && { cat; render "$FORGE_HOME/prompts/footprint.md" "RECORD=$out.footprint.md" "REGISTRY=$REGISTRY"; } \
+      | FORGE_LOOP=1 FORGE_JOURNAL="$out.commands.log" "$CLAUDE" -p --model "$model" "${PLUGIN_ARGS[@]}" \
       --add-dir "$RUN" "${perms[@]}" "$@" ) > "$out" 2>&1 || rc=$?
   echo "$rc" > "$out.rc"
+  register "$out"
+}
+
+# register <agent log>: bring one agent call's footprint into the registry,
+# however the call ended. Two things were written ahead while it ran, both
+# already on disk: the agent's intents (<log>.footprint.md, each written
+# before the thing it describes was created) and the command journal
+# (<log>.commands.log, written by a hook before each Bash command ran). The
+# <log>.open marker stays until both are in the registry, so a call that this
+# process never got to register is found by the next sweep.
+register() {
+  local f="$1.footprint.md" j="$1.commands.log"
+  {
+    if [[ -s "$f" ]]; then cat "$f"; else echo "No intent was recorded by this agent."; fi
+    echo
+    if [[ -f "$j" ]]; then echo "Command journal, written before each command ran ($(wc -l < "$j" | tr -d ' ') commands): \`$j\`"
+    else echo "No command journal: the agent ran no Bash command, or the journal hook was not loaded. Its log: \`$1\`"; fi
+  } | registry "agent ${1#"$RUN"/}"
+  mv "$1.open" "$1.registered" 2>/dev/null || true
+}
+
+# sweep: register every agent call a killed run left unregistered.
+sweep() {
+  local m
+  while IFS= read -r m; do register "${m%.open}"; done < <(find "$RUN" -name '*.open' -type f 2>/dev/null | sort)
 }
 
 # reviewer <agent> <model> <outfile>: a read-only headless context whose final
@@ -334,6 +389,7 @@ signature() { printf '%s %s' "$(git -C "$1" rev-parse HEAD)" "$(cksum < "$2")"; 
 prepare_slice() { # <slice>: worktree + state file. Runs in the scheduler, never concurrently.
   local s="$1" dir="$RUN/slices/$1" wt="$WT/slice-$1" br="forge/$SPEC/slice-$1"
   if [[ ! -d "$wt" ]]; then
+    record_worktree "$wt" "$br"   # the setup command is recorded once, with the integration worktree
     if git -C "$REPO" show-ref --verify --quiet "refs/heads/$br"; then
       git -C "$REPO" worktree add "$wt" "$br" >/dev/null 2>&1
     else
@@ -709,6 +765,36 @@ write_report() { # <gate verdict> <open findings file> <rounds> <open count>
   } > "$RUN/qa/report.md"
 }
 
+# --------------------------------------------------------------- cleanup ----
+
+# The cleanup pass: one agent reads the registry, checks every record against
+# the machine, runs the removals that are safe, and writes the rest to
+# cleanup-manual.md for the human. The limits do not rest on its judgement
+# alone: it works from the run directory, so it cannot edit code; it has no
+# `rm` (files inside the workspace go with `forge clean`, files outside it are
+# always the human's); and it may run only FORGE_CLEANUP_TOOLS, with --yolo
+# or without. A removal it is not allowed to run becomes a manual step.
+cmd_cleanup() {
+  local stamp out rc=0 why
+  sweep
+  [[ -s "$REGISTRY" ]] || { log "cleanup: nothing was recorded for #$SPEC"; return 0; }
+  stamp="$(date +%Y%m%d-%H%M%S)"; out="$RUN/cleanup-agent-$stamp.log"
+  log "cleanup: checking what the run left on the machine ($FORGE_MODEL_CLEANUP)"
+  render "$FORGE_HOME/prompts/cleanup.md" "REGISTRY=$REGISTRY" "MANUAL=$MANUAL" "STAMP=$stamp" "SPEC_N=$SPEC" \
+      "WORKSPACE=$REPO/.forge" "VERIFY_CMD=$(gate_text "$INT")" "SETUP_CMD=$(cfg "$INT" FORGE_SETUP_CMD)" \
+    | ( cd "$RUN" && "$CLAUDE" -p --model "$FORGE_MODEL_CLEANUP" "${PLUGIN_ARGS[@]}" --permission-mode acceptEdits \
+        --allowedTools Read Edit Write Glob Grep "Bash(ls:*)" "${FORGE_CLEANUP_TOOLS[@]}" ) > "$out" 2>&1 || rc=$?
+  echo "$rc" > "$out.rc"
+  why="$(agent_failure "$out")"
+  if [[ -n "$why" ]] || ! grep -q "^## Cleanup pass $stamp" "$REGISTRY" || [[ ! -f "$MANUAL" ]]; then
+    echo "The cleanup pass did not complete (${why:-it left no verdicts}). Nothing above this line has been checked since. Log: \`$out\`" | registry "cleanup pass $stamp: INCOMPLETE"
+    log "cleanup: the pass did not complete (${why:-it left no verdicts}; see $out). Run it again with: forge cleanup $SPEC"
+    return 0
+  fi
+  ledger "cleanup: pass $stamp finished, $(count_open '^- Status: open' "$MANUAL") step(s) left for a human"
+  log "cleanup: done. $(count_open '^- Status: open' "$MANUAL") step(s) need you: $MANUAL (walk through them with /forge:cleanup $SPEC)"
+}
+
 # ------------------------------------------------------------- commands -----
 
 preflight() {
@@ -726,6 +812,7 @@ ensure_integration() {
   local fresh=0 greenfield=0
   # A new project has nothing to set up or verify until its foundation slice merges.
   [[ -n "$FOUNDATION" && "$(status_of "$FOUNDATION")" != merged ]] && greenfield=1
+  record_worktree "$INT" "$INT_BRANCH" "$(cfg "$INT" FORGE_SETUP_CMD)"
   if git -C "$REPO" show-ref --verify --quiet "refs/heads/$INT_BRANCH"; then
     git -C "$REPO" worktree add "$INT" "$INT_BRANCH" >/dev/null 2>&1
   else
@@ -751,6 +838,7 @@ cmd_run() {
   trap 'log "interrupted; stopping agents"; for pid in $(jobs -p); do kill_tree "$pid"; done; exit 130' INT TERM
 
   rm -f "$RUN/halt"
+  sweep   # a run that was killed may have left agent calls unregistered
   snapshot_spec
   log "spec #$SPEC: ${#SLICES[@]} slice(s): ${SLICES[*]}"
   [[ -n "$FORGE_VERIFY_CMD" || -n "$FOUNDATION" ]] \
@@ -793,11 +881,13 @@ cmd_run() {
   if halted; then
     log "paused: $(cat "$RUN/halt")"
     log "nothing is lost. Resume with: forge run $SPEC"
+    log "what the run started (containers, servers) is still there for the resumed run. To stop it now: forge cleanup $SPEC"
     exit 75
   fi
-  if (( SKIP_QA )); then log "QA skipped (--skip-qa)"; return 0; fi
-  if (( merged_now == 0 )) && [[ -f "$RUN/qa/report.md" ]]; then log "nothing new merged; the existing QA report stands"; return 0; fi
-  cmd_qa
+  if (( SKIP_QA )); then log "QA skipped (--skip-qa)"
+  elif (( merged_now == 0 )) && [[ -f "$RUN/qa/report.md" ]]; then log "nothing new merged; the existing QA report stands"
+  else cmd_qa; fi
+  cmd_cleanup
 }
 
 cmd_status() {
@@ -860,7 +950,15 @@ main() {
   [[ -z "$logfile" ]] || exec > "$logfile" 2>&1
   case "$cmd" in
     run) cmd_run ;;
-    qa) preflight; rm -f "$RUN/halt"; snapshot_spec; cmd_qa ;;
+    qa)
+      preflight; rm -f "$RUN/halt"; snapshot_spec; cmd_qa
+      # `forge qa` takes no lock. Under a live run, the pass would stop what that run is using.
+      if [[ -d "$RUN/.lock" ]]; then log "cleanup: skipped, a forge run holds #$SPEC; it runs the pass when it ends"; else cmd_cleanup; fi ;;
+    cleanup)
+      command -v "$CLAUDE" >/dev/null 2>&1 || die "missing dependency: $CLAUDE"
+      mkdir "$RUN/.lock" 2>/dev/null || die "a forge run holds #$SPEC; cleaning up under it would stop what it is using (remove $RUN/.lock if it died)"
+      trap 'rmdir "$RUN/.lock" 2>/dev/null || true' EXIT
+      cmd_cleanup ;;
     status) cmd_status ;;
     unblock) cmd_unblock "${pos[1]:?usage: forge unblock <spec> <slice>}" ;;
     clean) cmd_clean ;;

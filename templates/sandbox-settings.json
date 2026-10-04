@@ -5,7 +5,8 @@
       "forge pr *",
       "forge doctor",
       "forge run *",
-      "forge qa *"
+      "forge qa *",
+      "forge cleanup *"
     ],
     "filesystem": {
       "denyRead": ["~/.config/gh"]
@@ -22,7 +23,8 @@
       "Bash(forge issue edit *)",
       "Bash(forge pr push *)",
       "Bash(forge run *)",
-      "Bash(forge qa *)"
+      "Bash(forge qa *)",
+      "Bash(forge cleanup *)"
     ]
   }
 }
