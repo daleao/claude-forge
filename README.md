@@ -273,7 +273,7 @@ LINEAGE.md                   where each part came from, and why it is the way it
 
 ## Sandboxed sessions
 
-Forge works with Claude Code's Bash sandbox switched on, without opening the sandbox to GitHub. A session never calls `gh`. It calls a few fixed `forge` commands, and only those run outside the sandbox, so your test suite and anything a package installs still have no network and no access to your GitHub token:
+Forge works with Claude Code's Bash sandbox switched on, without opening the sandbox to GitHub. A session never calls `gh`. It calls a few fixed `forge` commands, and only those run outside the sandbox, so the commands a session or an agent runs (your tests, anything a package installs) still have no network and no access to your GitHub token:
 
 | Command | What it can do |
 | --- | --- |
@@ -293,6 +293,37 @@ The settings are in [`templates/sandbox-settings.json`](templates/sandbox-settin
 - `sandbox.filesystem.denyRead` hides `~/.config/gh` from sandboxed commands. If `gh` keeps its token in your system keyring this changes nothing; it is there for the plain-file case.
 
 Two things to know. A `forge` command must be the whole Bash call: a pipe, a redirect, a `cd` or a second command keeps the call sandboxed, so use `forge run <spec> --log <file>` to capture a run's output. And if your organisation locks the sandbox in managed settings, `excludedCommands` in your own files may be ignored; ask your administrator to add them.
+
+### What a run can reach
+
+A run has two kinds of command, and the sandbox treats them differently:
+
+- **The script's own commands run outside the sandbox**, because `forge run` does. That covers the setup command and the gate each time the loop runs them: they have your network, your Docker daemon and your full file access.
+- **The agents' commands run inside it.** Each headless agent reads the same settings as your session, so an implementer running the gate itself gets no network, no Unix sockets, and write access only to its worktree and the temp directory.
+
+A gate that needs none of those works with no further setup. A gate that does will pass when the script runs it and fail when an agent runs it, so the agent cannot check its own work and the slice spends its iterations finding out from the loop. Three things commonly need opening, in the project's committed `.claude/settings.json` (a worktree is a checkout, so it carries committed files and not `.claude/settings.local.json`):
+
+| The agent needs | Symptom inside the sandbox | Setting |
+| --- | --- | --- |
+| a package registry | `CONNECT tunnel failed, response 403` | `sandbox.network.allowedDomains` |
+| a tool's cache under your home directory | `Read-only file system` | `sandbox.filesystem.allowWrite` |
+| the Docker daemon (`docker`, Compose, Testcontainers) | `permission denied` on the Docker socket | `sandbox.excludedCommands` |
+
+The first two keep the command sandboxed. Docker cannot work inside the sandbox, so the commands that reach it have to leave it. Name the narrowest command that does: the test command, not the tool.
+
+```json
+{
+  "sandbox": {
+    "excludedCommands": ["dotnet test *", "pnpm run e2e *"],
+    "network": { "allowedDomains": ["api.nuget.org", "registry.npmjs.org"] },
+    "filesystem": { "allowWrite": ["~/.nuget", "~/.local/share/NuGet", "~/.local/share/pnpm"] }
+  }
+}
+```
+
+An excluded command runs with your full access, and a test command runs code the agent wrote. Once one is excluded, the sandbox no longer keeps an agent away from your network or your GitHub token; it still stops everything the agent runs by other means. If you need that boundary to hold, run Forge inside a virtual machine or a dev container, or give `gh` a token scoped to the one repository.
+
+An excluded command must also be the whole Bash call. `dotnet test apps/api` leaves the sandbox; `cd apps/api && dotnet test`, `dotnet test | tail` and a gate that chains it after a command with no entry of its own all stay inside. Say so in the project's `CLAUDE.md`, so agents run those commands bare.
 
 ## Status
 
