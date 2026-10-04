@@ -288,6 +288,29 @@ These are the only agent definitions, and they are split by **axis**, not by rol
 
 **New.** The preflight list mirrors what the script would otherwise discover the slow way. "If the run pauses" documents the exit-75 contract.
 
+## Class mode
+
+### `skills/teach/` (4 files)
+
+- **Brief**: a second way through the pipeline, attended throughout, where the agent is engineer and teacher and the user is a student assumed to know nothing. The brief's own rules are the skeleton: ask before each new concept, explain to the depth requested, plain language and analogies, every line of code in small chunks, the plan stated before each step, a pause for questions, understanding challenged before anything new, tangents, and self-study offered to save tokens.
+- **The inversion (New)**: Forge's interview assumes a user who can answer. A student cannot, and agrees with whatever is proposed. So decisions are split: **intent** is asked, everything technical is decided by the agent and then taught in five parts (the question, why it must be answered, the options, the choice, what would change it). Forge's "defaults" are still shown, briefly; nothing is silent. Approval steps in spec and slice become read-throughs, since an approval from someone who cannot judge is worth nothing.
+- **"A nod is not evidence" (New, from the Brief's problem statement)**: the four concept states and the rule that only an explain-back, a prediction or an answered question moves a concept to `demonstrated`.
+- **From MP `productivity/teach`**:
+  - the **mission** (why the learner wants this), asked first and used to ground every lesson
+  - **learning records**, folded into the notebook's concept ledger: "coverage is not learning; wait for evidence", record stated prior knowledge with its depth, and record corrected misconceptions because they predict later ones
+  - **fluency against storage strength**: recall practice, spacing and interleaving, here as the quiz that opens every session and unit
+  - difficulty is the enemy while acquiring knowledge and the tool while building skill
+  - the glossary rule "add a term only when the user understands it"
+  - quiz options of equal length, so formatting gives nothing away
+  - primary sources over the model's memory
+  - a place for the learner's stated preferences
+- **Not taken from MP `teach`**: HTML lessons, the shared asset library and the reference documents (the lesson here is the conversation and the artefact is the project itself); communities as the source of wisdom (outside a build's scope); a workspace per topic (the course lives inside the project it builds).
+- **Reuses, unedited**: `forge:grilling`, `forge:domain-modeling`, `forge:tdd`, `forge:debugging`, `forge:verification`, the spec templates, the slice rules and template, and the whole QA audit with its agents and fix prompt. `spec`, `slice` and `qa` are user-invoked and cannot be called by another skill, so `SYLLABUS.md` points at their files, the same arrangement as `NEW-PROJECT.md`.
+- **Why the same plugin**: class mode needs Forge's engineering judgement with a different delivery. A separate plugin would copy those skills or depend on them across plugins.
+- **Why it cannot interfere**: one user-invoked skill (`disable-model-invocation`), no hook, no change to the script, prompts, agents or any existing skill. It never starts `forge run`, and its state is in `.forge/class/`, which nothing else reads.
+- **Local files, not issues**: a student may have no GitHub repository and nothing unattended needs to read the spec. The files use the issue templates verbatim, so a course's spec could be published later.
+- **The audit is the exception to line-by-line** (your decision): it runs in full, attended, and stops only to explain and discuss findings. Fix rounds always run instead of being offered.
+
 ---
 
 ## agent-rules-books: what was used and how

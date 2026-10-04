@@ -20,6 +20,8 @@ What you get:
 - **Proof, not claims.** The script runs the gate itself, three independent reviewers audit the result, and fix rounds are bounded.
 - **A human decision at the end.** The run produces a PR and a report that leads with what needs your judgement. Nothing merges into your base branch without you.
 
+There is also a second way through the same steps: [class mode](#class-mode-forgeteach), where the agent builds the idea with you in the room and teaches you everything behind it.
+
 Forge builds on four open-source projects; see [Credits](#credits).
 
 ## Requirements
@@ -202,6 +204,25 @@ Then it briefs you from the report, decisions first: slices that didn't merge, f
 
 Afterwards, `/forge:retro 42` turns the run's stalls, rulings and QA findings into improvements to the agents' environment: a new check in the gate, a constitution rule, a slicing habit.
 
+## Class mode: `/forge:teach`
+
+```
+/forge:teach I want a command-line tool that tracks my reading list
+```
+
+The same five steps, run as a course. The agent is the engineer and the teacher, you are the student, and the syllabus is the whole project. It is the slow way on purpose: the aim is that you could explain every part of what was built.
+
+- **You own the intent, the agent owns the engineering.** It asks you what you want and who it is for. It does not ask you technical questions you could only nod along to: it makes those decisions, then teaches each one as the question, why it had to be answered, the options, its choice, and what would change that choice.
+- **One concept at a time.** It asks whether you have met a concept, explains it as far as you want, and checks it before building on it. "Makes sense" does not count: you explain it back, predict a result, or answer a what-if.
+- **Code in small pieces.** A few lines, explained line by line, with your prediction before anything runs. The test comes first, as in the unattended build.
+- **You can go and read.** For large, well-documented subjects it gives you a primary source, search terms and a question to bring back, which also saves tokens.
+- **The audit still runs in full.** The three reviewers and the fix rounds are the same; the class stops only to explain and discuss what they found.
+- **You steer the depth.** Say `deeper`, `again`, `I know this`, `not important`, `I'll go read`, `quiz me`, `park it` or `break` at any time.
+
+A course lasts many sessions. Its state is in `.forge/class/<course>/` and is committed: a notebook (what you know and how the agent knows it, every decision with its reason, where the class stands), a glossary of the terms you have learned, the spec, the slices and the audit report. `/forge:teach` with no argument resumes it, starting with a short quiz on earlier material.
+
+Class mode does not start the `forge` script, publishes no issues and needs no GitHub repository. The work lands on a `class/<course>` branch, and merging it is your call.
+
 ## Where everything lives
 
 The project memory hierarchy, and who reads what:
@@ -217,8 +238,9 @@ The project memory hierarchy, and who reads what:
 | Cleanup registry: what each agent and the script left on the machine, and the cleanup pass's verdicts | `.forge/runs/<spec>/cleanup-registry.md` | the cleanup pass; you |
 | Manual cleanup: the steps the pass would not take, with instructions | `.forge/runs/<spec>/cleanup-manual.md` | you; `/forge:review`, `/forge:cleanup` |
 | Coding standards (optional) | `CODING_STANDARDS.md` | QA code reviewer only |
+| A class: notebook, glossary, spec, slices, audit report | `.forge/class/<course>/` | `/forge:teach`, at every resume; you |
 
-`.forge/runs/` and `.forge/worktrees/` are git-ignored. Delete a run directory to forget a run.
+`.forge/runs/` and `.forge/worktrees/` are git-ignored. Delete a run directory to forget a run. `.forge/class/` is committed.
 
 ## What's in this folder
 
@@ -240,6 +262,7 @@ hooks/                       context guard (PostToolUse); command journal for th
 templates/                   config.sh, constitution.md, state.md, sandbox-settings.json, workspace-only.sh
 skills/
   grill  spec  slice  run  review          the five steps (user-invoked)
+  teach (+ lesson, syllabus, notebook)     the five steps as an attended class (user-invoked)
   grilling  domain-modeling                discovery primitives
   tdd  debugging  verification             implementation disciplines
   codebase-design                          deep-module vocabulary
@@ -352,7 +375,7 @@ Forge is new. The script has been tested end to end against stub `gh` and `claud
 
 Forge selects and adapts ideas from four MIT-licensed projects, whose licences are in [`licenses/`](licenses/):
 
-- [Matt Pocock's skills](https://github.com/mattpocock/skills): the interview, the spec and vertical slicing, and much of the TDD discipline
+- [Matt Pocock's skills](https://github.com/mattpocock/skills): the interview, the spec and vertical slicing, much of the TDD discipline, and the teaching method behind class mode
 - [Superpowers](https://github.com/obra/superpowers) (Jesse Vincent): TDD, verification before claims, worktree practice
 - get-shit-done (Lex Christopherson; now continued as [gsd-core](https://github.com/open-gsd/gsd-core)): durable state across fresh contexts
 - agent-rules-books (Maciej Ciemborowicz): the constitution and the review lenses

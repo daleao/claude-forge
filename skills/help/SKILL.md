@@ -26,6 +26,10 @@ A change small enough to need no spec skips to one slice issue (`/forge:spec` de
 
 If `forge run` stops with `paused:` (exit status 75), it hit a usage limit or a failed agent call. Nothing is lost; run it again later.
 
+## The same flow, as a class
+
+**`/forge:teach <idea>`** runs all five steps attended, in the session, with the agent as teacher and you as student. It makes the technical decisions and teaches each one, builds a few lines at a time, and checks your understanding before moving on. Nothing runs unattended and no issues are published; the course lives in `.forge/class/<course>/`. Run `/forge:teach` with no argument to resume. Pick it when the aim is to understand the project, not to get it built quickly.
+
 ## Detours from the main flow
 
 - **`forge:research`**: a question that reading can settle. Runs as a background agent, leaves cited notes in the repo. Reach for it during the grilling.
@@ -62,6 +66,7 @@ Model-invoked references the steps above pull in. Reach for one directly when it
 | What a run left on the machine, and what is left for you to remove | `.forge/runs/<spec>/cleanup-registry.md`, `cleanup-manual.md` |
 | Worktrees | `.forge/worktrees/<spec>/`, git-ignored |
 | Config (gate command, models, limits) | `.forge/config.sh` |
+| A class: notebook, glossary, spec, slices, audit report | `.forge/class/<course>/`, committed |
 
 ## Context, in interactive sessions
 

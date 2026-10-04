@@ -1,7 +1,7 @@
 {
   "name": "forge",
-  "version": "0.2.0",
-  "description": "Grill, spec, slice, then an unattended Ralph loop with TDD and an adversarial QA phase, ending in a human-reviewed PR.",
+  "version": "0.3.0",
+  "description": "Grill, spec, slice, then an unattended Ralph loop with TDD and an adversarial QA phase, ending in a human-reviewed PR. Or the same pipeline as an attended class that teaches you everything it builds.",
   "license": "MIT",
   "keywords": [
     "workflow",
@@ -9,7 +9,8 @@
     "spec",
     "tdd",
     "ralph-loop",
-    "qa"
+    "qa",
+    "teaching"
   ],
   "author": {
     "name": "daleao"

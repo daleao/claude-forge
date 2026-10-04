@@ -8,7 +8,7 @@
     {
       "name": "forge",
       "source": "./",
-      "description": "Grill, spec, slice, then an unattended Ralph loop with TDD and an adversarial QA phase, ending in a human-reviewed PR."
+      "description": "Grill, spec, slice, then an unattended Ralph loop with TDD and an adversarial QA phase, ending in a human-reviewed PR. Or the same pipeline as an attended class that teaches you everything it builds."
     }
   ]
 }
