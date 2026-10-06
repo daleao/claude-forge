@@ -41,6 +41,10 @@ A repo document overrides a lens or a smell where they disagree. Skip anything t
 - **Accidental complexity**: code that could do the same job with fewer concepts.
 - **Errors**: failures swallowed, or surfaced with nothing to diagnose them by.
 
+## A follow-up audit
+
+When the prompt says this is a follow-up audit, the diff holds only the commits since the last audit, and the prompt gives that audit's report. Review the new commits. The earlier report is background: it tells you what was already judged, and its findings are checked separately, so do not repeat them.
+
 ## Severity
 
 - `BLOCKER`: a safety issue; a regression in existing behaviour; data left inconsistent.

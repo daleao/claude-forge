@@ -2,7 +2,7 @@
 # forge: the unattended half of the Forge workflow.
 #
 #   forge run <spec>      work the spec's slices to a reviewed draft PR
-#   forge qa <spec>       (re)run the autonomous QA phase on the integration branch
+#   forge qa <spec>       resume a paused audit, or audit what is new since the last one
 #   forge status <spec>   show every slice's status and the current frontier
 #   forge unblock <spec> <slice>   put a blocked slice back on the frontier
 #   forge cleanup <spec>  (re)run the cleanup pass over what the run left on the machine
@@ -50,6 +50,8 @@ Options for `run`:
   --yolo             run agents with --dangerously-skip-permissions (sandbox only)
   --local            no push, no PR, no issue comments; the report stays on disk
   --skip-qa          stop after the slices are merged
+  --full             audit the whole branch from the start (also for `qa`), not
+                     only the commits since the last audit, and resume nothing
   --max-parallel N   override FORGE_MAX_PARALLEL
   --log FILE         write all output to FILE (a sandboxed session cannot redirect it)
 EOF
@@ -63,6 +65,12 @@ DEFAULT_TOOLS=(Read Edit Write Glob Grep Skill
   "Bash(git commit:*)" "Bash(git merge:*)" "Bash(git checkout:*)" "Bash(git rm:*)" "Bash(git mv:*)"
   "Bash(git restore:*)" "Bash(mkdir:*)" "Bash(ls:*)")
 
+# What the audit's diff leaves out when the config lists nothing: lock files,
+# which a reviewer cannot judge line by line. Each entry is a git glob pathspec.
+DEFAULT_DIFF_EXCLUDE=("**/package-lock.json" "**/npm-shrinkwrap.json" "**/pnpm-lock.yaml" "**/yarn.lock"
+  "**/bun.lock" "**/Cargo.lock" "**/poetry.lock" "**/uv.lock" "**/Pipfile.lock" "**/Gemfile.lock"
+  "**/composer.lock" "**/go.sum" "**/packages.lock.json" "**/flake.lock")
+
 default_branch() { # the repo's default branch, without asking anyone
   local b; b="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)"; b="${b#origin/}"
   if [[ -n "$b" ]]; then echo "$b"
@@ -75,7 +83,7 @@ load_config() {
   git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
   REPO="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
   [[ -f "$REPO/.forge/config.sh" ]] || die "no .forge/config.sh in $REPO (run /forge:setup)"
-  FORGE_ALLOWED_TOOLS=(); FORGE_CLEANUP_TOOLS=()
+  FORGE_ALLOWED_TOOLS=(); FORGE_CLEANUP_TOOLS=(); unset FORGE_QA_DIFF_EXCLUDE
   # shellcheck disable=SC1091
   source "$REPO/.forge/config.sh"
   : "${FORGE_VERIFY_CMD:=}" "${FORGE_SETUP_CMD:=}"
@@ -83,8 +91,11 @@ load_config() {
   : "${FORGE_MAX_PARALLEL:=3}" "${FORGE_MAX_ITERATIONS:=10}" "${FORGE_STALL_LIMIT:=2}"
   : "${FORGE_QA_MAX_ROUNDS:=2}" "${FORGE_MODEL_IMPLEMENT:=sonnet}"
   : "${FORGE_MODEL_ESCALATE:=opus}" "${FORGE_MODEL_QA:=opus}"
+  : "${FORGE_NOTIFY_CMD:=}"
   : "${FORGE_USAGE_STOP_PERCENT=90}" "${FORGE_USAGE_MAX_AGE:=900}"   # set it to "" to switch the threshold off
   (( ${#FORGE_ALLOWED_TOOLS[@]} )) || FORGE_ALLOWED_TOOLS=("${DEFAULT_TOOLS[@]}")
+  # Unset = the usual lock files; FORGE_QA_DIFF_EXCLUDE=() leaves nothing out.
+  declare -p FORGE_QA_DIFF_EXCLUDE >/dev/null 2>&1 || FORGE_QA_DIFF_EXCLUDE=("${DEFAULT_DIFF_EXCLUDE[@]}")
   USAGE_FILE="${FORGE_USAGE_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/forge/usage.json}"
   CONSTITUTION="$REPO/.forge/constitution.md"
   # Headless contexts load this plugin from disk. If your Claude Code version
@@ -92,6 +103,7 @@ load_config() {
   PLUGIN_ARGS=(--plugin-dir "$FORGE_HOME"); [[ -z "${FORGE_NO_PLUGIN_DIR:-}" ]] || PLUGIN_ARGS=()
   : "${FORGE_MODEL_CLEANUP:=$FORGE_MODEL_QA}"
   YOLO=0; LOCAL=0; SKIP_QA=0; FOUNDATION=""
+  QA_FULL=0; QA_MODE=full; QA_FROM=""; QA_PIN=""
 }
 
 init_spec() {
@@ -157,16 +169,30 @@ record_worktree() {
   } | registry "${1##*/}: forge"
 }
 
+# notify <message>: tell the human now, from the script itself, so it works
+# with no session open. FORGE_NOTIFY_CMD is run with the title as $1 and the
+# message as $2; without one, the desktop's own notifier is used if there is
+# one. A notifier that fails or hangs never fails the run.
+notify() {
+  local title="forge #$SPEC (${REPO##*/})"
+  if [[ -n "$FORGE_NOTIFY_CMD" ]]; then timeout 20 bash -c "$FORGE_NOTIFY_CMD" forge-notify "$title" "$1"
+  elif command -v notify-send >/dev/null 2>&1; then timeout 20 notify-send -a forge -u critical "$title" "$1"
+  elif command -v osascript >/dev/null 2>&1; then
+    timeout 20 osascript -e 'on run a' -e 'display notification (item 2 of a) with title (item 1 of a)' -e 'end run' "$title" "$1"
+  fi >/dev/null 2>&1 || true
+}
+
 block() { # <slice> <reason>
   set_status "$1" blocked
   printf '%s\n' "$2" > "$RUN/slices/$1/blocked-reason"
   ledger "slice $1: blocked: $2"
   log "slice #$1 BLOCKED: $2"
+  notify "slice #$1 blocked: $2"
 }
 
 # A halt pauses the whole run at a safe point: nothing new starts, each running
 # slice stops before its next iteration, and every slice stays resumable.
-halt() { [[ -f "$RUN/halt" ]] || { printf '%s\n' "$1" > "$RUN/halt"; ledger "halt: $1"; log "PAUSING: $1"; }; }
+halt() { [[ -f "$RUN/halt" ]] || { printf '%s\n' "$1" > "$RUN/halt"; ledger "halt: $1"; log "PAUSING: $1"; notify "paused: $1. Resume with: forge run $SPEC"; }; }
 halted() { [[ -f "$RUN/halt" ]]; }
 
 LIMIT_RE='usage limit|hit your limit|limit reached|rate limit exceeded|out of extra usage'
@@ -320,11 +346,12 @@ sweep() {
 reviewer() {
   local name="$1" model="$2" out="$3" rc=0
   local -a perms
+  rm -f "$out" "$out.rc"   # a call that is killed leaves no report, so the stage runs again
   if (( YOLO )); then perms=(--dangerously-skip-permissions)
   else perms=(--allowedTools Read Grep Glob "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"); fi
   ( cd "$INT" && "$CLAUDE" -p --agent "forge:$name" --model "$model" "${PLUGIN_ARGS[@]}" \
-      --add-dir "$RUN" --add-dir "$FORGE_HOME" "${perms[@]}" ) > "$out" 2> "$out.err" || rc=$?
-  echo "$rc" > "$out.rc"
+      --add-dir "$RUN" --add-dir "$FORGE_HOME" "${perms[@]}" ) > "$out.part" 2> "$out.err" || rc=$?
+  echo "$rc" > "$out.rc"; mv "$out.part" "$out"
 }
 
 # ------------------------------------------------------------- snapshots ----
@@ -713,8 +740,47 @@ cmd_doctor() {
 }
 
 # -------------------------------------------------------------------- QA ----
+#
+# The audit is a row of stages, and each stage's output file is its checkpoint:
+# packaging (diff, tickets, gate), one report per reviewer, then per fix round
+# the fixer, the gate and the recheck. A stage whose output is on disk and
+# valid is not run again, so a paused audit resumes where it stopped.
+#   qa/scope     the commits the audit in progress covers; gone when it finishes
+#   qa/audited   what the last finished audit covered; the next one audits only
+#                the commits since (a follow-up), unless what the verdicts rest
+#                on has changed or --full was given
+
+RECHECK_RE='^- \[(ADDRESSED|OPEN|PARKED|NEW)\]'
+BLOCKING_RE='^- \[(BLOCKER|IMPORTANT)\]'
 
 count_open() { { grep -cE "$1" "$2" || true; }; }
+
+# What an audit's verdicts rest on besides the commits. The spec's Slices list
+# is left out: a follow-up run appends to it.
+qa_key() {
+  { awk '/^## / { skip = (tolower($0) ~ /^## slices[ \t\r]*$/) } !skip' "$RUN/spec.md"
+    cat "$CONSTITUTION" "$FORGE_HOME"/skills/qa/lenses/*.md
+    printf '%s\n' "${FORGE_QA_DIFF_EXCLUDE[@]}"; } 2>/dev/null | git hash-object --stdin || true
+}
+
+# qa_diff <range>: what a reviewer reads: commit list, stat, full diff with
+# context. Paths matching FORGE_QA_DIFF_EXCLUDE (lock files, generated code)
+# stay in the stat and are named, but their content is left out.
+qa_diff() {
+  local p left; local -a keep=() drop=()
+  for p in "${FORGE_QA_DIFF_EXCLUDE[@]}"; do keep+=(":(exclude,glob)$p"); drop+=(":(glob)$p"); done
+  git -C "$INT" log --oneline "$1"; echo
+  git -C "$INT" diff --stat "$1"; echo
+  if (( ${#drop[@]} )); then
+    left="$(git -C "$INT" diff --name-only "$1" -- "${drop[@]}")"
+    if [[ -n "$left" ]]; then
+      echo "Changed, but left out of the diff below (lock files and generated code, FORGE_QA_DIFF_EXCLUDE)."
+      echo "To read one: git diff $1 -- <path>"
+      printf '%s\n\n' "$left"
+    fi
+  fi
+  git -C "$INT" diff -U10 "$1" -- . "${keep[@]}"
+}
 
 qa_inputs() { # the prompt every reviewer gets: paths only
   cat <<EOF
@@ -727,83 +793,237 @@ Audit the branch checked out in this directory.
 - Constitution: $CONSTITUTION
 - Lens directory: $FORGE_HOME/skills/qa/lenses
 EOF
+  [[ "$QA_MODE" == followup ]] || return 0
+  cat <<EOF
+
+This is a follow-up audit. The diff holds only the commits since the last audit, which covered the branch up to ${QA_FROM:0:12}.
+- Report of that audit: $RUN/qa/last-report.md
+EOF
+}
+
+# qa_resumable <head> <key>: is the audit in qa/scope still the audit of this
+# branch? The branch must stand where the last finished stage left it. The one
+# exception is a fixer that was interrupted: its commits are kept.
+qa_resumable() {
+  local mode from pin key last r
+  [[ -f "$RUN/qa/scope" ]] || return 1
+  read -r mode from pin key < "$RUN/qa/scope" || return 1
+  [[ "$key" == "$2" ]] || return 1
+  last="$pin"
+  for (( r = 1; ; r++ )); do
+    if [[ -f "$RUN/qa/fix-$r.head" ]]; then last="$(cat "$RUN/qa/fix-$r.head")"
+    elif [[ -f "$RUN/qa/fix-$r.base" ]]; then
+      git -C "$INT" merge-base --is-ancestor "$(cat "$RUN/qa/fix-$r.base")" "$1" 2>/dev/null; return
+    else break; fi
+  done
+  [[ "$last" == "$1" ]]
+}
+
+# qa_begin <mode> <from> <head> <key>: start a new audit. The stage files of
+# the one before go; a follow-up keeps what that audit handed on.
+qa_begin() {
+  local q="$RUN/qa" f
+  rm -f "$q/scope" "$q/diff.patch" "$q/slices.md" "$q/gate.log" "$q/gate.verdict" \
+    "$q"/{spec,tests,code}-axis.md{,.rc,.err} "$q"/carry.md{,.rc,.err} "$q"/open-*.md \
+    "$q"/fix-[0-9]*.md "$q"/fix-*.patch "$q"/fix-*.base "$q"/fix-*.head "$q"/fix-*.gate "$q"/recheck-*.md*
+  if [[ "$1" == followup ]]; then
+    for f in history parked; do [[ ! -f "$q/$f.md" ]] || cp "$q/$f.md" "$q/carried-$f.md"; done
+  else rm -f "$q"/carried-*.md "$q/standing.md" "$q/last-report.md"; fi
+  printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" > "$q/scope"
+}
+
+# Is there a finished audit on disk? A paused one leaves qa/scope and a report
+# that says it is incomplete.
+audit_complete() {
+  [[ -f "$RUN/qa/report.md" && ! -f "$RUN/qa/scope" ]] && ! grep -q '^\*\*AUDIT INCOMPLETE' "$RUN/qa/report.md"
 }
 
 # The audit could not complete. Say so; never let silence read as "clean".
 qa_pause() { # <reason>
+  local s kept=""
   halt "$1"
-  printf '# Forge report: #%s\n\n**AUDIT INCOMPLETE.** %s.\n\nNo conclusion can be drawn about this branch from this report. Re-run the audit with `forge qa %s`.\n' \
-    "$SPEC" "$1" "$SPEC" > "$RUN/qa/report.md"
+  for s in spec tests code; do
+    [[ -n "$(reviewer_failure "$RUN/qa/$s-axis.md" '^### Findings')" ]] || kept+="- the $s reviewer's report"$'\n'
+  done
+  for s in "$RUN"/qa/open-[1-9]*.md; do
+    [[ ! -f "$s" ]] || kept+="- fix round $(basename "$s" .md | cut -d- -f2), with its recheck"$'\n'
+  done
+  { printf '# Forge report: #%s\n\n**AUDIT INCOMPLETE.** %s.\n\nNo conclusion can be drawn about this branch from this report. ' "$SPEC" "$1"
+    printf 'Run `forge qa %s` again to resume: the stages that finished are kept and not repeated.\n' "$SPEC"
+    [[ -z "$kept" ]] || printf '\nFinished so far:\n\n%s' "$kept"
+  } > "$RUN/qa/report.md"
   log "the audit did not complete, and the PR was left as it was. Resume with: forge qa $SPEC"
   exit 75
 }
 
 cmd_qa() {
-  local base gate_verdict=PASS r open findings s why
+  local base head key gate_verdict r open findings s why note retry q="$RUN/qa"
+  local ahead="" abase="" akey=""
+  local -a todo=()
   git -C "$REPO" show-ref --verify --quiet "refs/heads/$INT_BRANCH" || die "no integration branch for #$SPEC (nothing has run yet)"
   ensure_integration
-  base="$(git -C "$INT" merge-base "$FORGE_BASE_BRANCH" HEAD)"
-  [[ "$base" != "$(git -C "$INT" rev-parse HEAD)" ]] || { log "QA: the integration branch has no commits; nothing to audit"; return 0; }
-  log "QA: packaging the branch"
-  { git -C "$INT" log --oneline "$base..HEAD"; echo; git -C "$INT" diff --stat "$base..HEAD"; echo
-    git -C "$INT" diff -U10 "$base..HEAD"; } > "$RUN/qa/diff.patch"
-  : > "$RUN/qa/slices.md"
-  for s in "${SLICES[@]}"; do { cat "$RUN/slices/$s/ticket.md"; printf '\n\n---\n\n'; } >> "$RUN/qa/slices.md"; done
-  gate "$INT" "$RUN/qa/gate.log" || gate_verdict=FAIL
+  base="$(git -C "$INT" merge-base "$FORGE_BASE_BRANCH" HEAD)"; head="$(git -C "$INT" rev-parse HEAD)"
+  [[ "$base" != "$head" ]] || { log "QA: the integration branch has no commits; nothing to audit"; return 0; }
+  key="$(qa_key)"
 
-  usage_check; halted && qa_pause "$(cat "$RUN/halt")"
-  log "QA: three reviewers in parallel ($FORGE_MODEL_QA)"
-  qa_inputs "$gate_verdict" | reviewer qa-spec  "$FORGE_MODEL_QA" "$RUN/qa/spec-axis.md" &
-  qa_inputs "$gate_verdict" | reviewer qa-tests "$FORGE_MODEL_QA" "$RUN/qa/tests-axis.md" &
-  qa_inputs "$gate_verdict" | reviewer qa-code  "$FORGE_MODEL_QA" "$RUN/qa/code-axis.md" &
-  wait
+  if (( ! QA_FULL )) && qa_resumable "$head" "$key"; then
+    read -r QA_MODE QA_FROM QA_PIN _ < "$q/scope"
+    log "QA: resuming the audit that paused; the stages that finished are kept"
+  else
+    QA_MODE=full; QA_FROM="$base"; QA_PIN="$head"
+    if (( ! QA_FULL )) && [[ -f "$q/audited" ]]; then
+      read -r ahead abase akey < "$q/audited" || true
+      if [[ "$akey" == "$key" && "$abase" == "$base" ]] && git -C "$INT" merge-base --is-ancestor "$ahead" "$head" 2>/dev/null; then
+        if [[ "$ahead" == "$head" ]]; then
+          log "QA: nothing new since the last audit; its report stands at $q/report.md. To audit the whole branch again: forge qa $SPEC --full"
+          return 0
+        fi
+        QA_MODE=followup; QA_FROM="$ahead"
+      else
+        log "QA: the spec, the constitution, the lenses, the diff exclusions or the base have changed since the last audit; auditing the whole branch"
+      fi
+    fi
+    qa_begin "$QA_MODE" "$QA_FROM" "$QA_PIN" "$key"
+  fi
+
+  if [[ ! -f "$q/gate.verdict" ]]; then
+    if [[ "$QA_MODE" == followup ]]; then log "QA: packaging the commits since the last audit (${QA_FROM:0:12}); --full audits the whole branch"
+    else log "QA: packaging the branch"; fi
+    qa_diff "$QA_FROM..$QA_PIN" > "$q/diff.patch"
+    : > "$q/slices.md"
+    for s in "${SLICES[@]}"; do { cat "$RUN/slices/$s/ticket.md"; printf '\n\n---\n\n'; } >> "$q/slices.md"; done
+    gate_verdict=PASS; gate "$INT" "$q/gate.log" || gate_verdict=FAIL
+    echo "$gate_verdict" > "$q/gate.verdict"
+  fi
+  gate_verdict="$(cat "$q/gate.verdict")"
+
   for s in spec tests code; do
-    why="$(reviewer_failure "$RUN/qa/$s-axis.md" '^### Findings')"
-    [[ -z "$why" ]] || qa_pause "The $s reviewer produced no report: $why"
+    [[ -z "$(reviewer_failure "$q/$s-axis.md" '^### Findings')" ]] || todo+=("$s")
   done
+  if (( ${#todo[@]} )); then
+    usage_check; halted && qa_pause "$(cat "$RUN/halt")"
+    log "QA: ${#todo[@]} reviewer(s) in parallel: ${todo[*]} ($FORGE_MODEL_QA)"
+    for s in "${todo[@]}"; do qa_inputs "$gate_verdict" | reviewer "qa-$s" "$FORGE_MODEL_QA" "$q/$s-axis.md" & done
+    wait
+    for s in "${todo[@]}"; do
+      why="$(reviewer_failure "$q/$s-axis.md" '^### Findings')"
+      [[ -z "$why" ]] || qa_pause "The $s reviewer produced no report: $why"
+    done
+  fi
 
-  findings="$RUN/qa/open-0.md"
-  { grep -hE '^- \[(BLOCKER|IMPORTANT|MINOR)\]' "$RUN/qa/spec-axis.md" "$RUN/qa/tests-axis.md" "$RUN/qa/code-axis.md" || true; } > "$findings"
-  [[ "$gate_verdict" == FAIL ]] && echo "- [BLOCKER] gate — the verify command fails on the integration branch — see $RUN/qa/gate.log — make it pass" >> "$findings"
-  open="$(count_open '^- \[(BLOCKER|IMPORTANT)\]' "$findings")"
-  rm -f "$RUN"/qa/fix-*.md "$RUN"/qa/fix-*.patch "$RUN"/qa/recheck-*.md "$RUN"/qa/parked.md
+  # A follow-up: what the last audit left open is judged against the new commits.
+  if [[ "$QA_MODE" == followup && -s "$q/standing.md" ]] && (( $(count_open "$BLOCKING_RE" "$q/standing.md") > 0 )) \
+      && [[ -n "$(reviewer_failure "$q/carry.md" "$RECHECK_RE")" ]]; then
+    usage_check; halted && qa_pause "$(cat "$RUN/halt")"
+    log "QA: checking the findings the last audit left open against the new commits"
+    cat <<EOF | reviewer qa-recheck "$FORGE_MODEL_QA" "$q/carry.md"
+A follow-up audit. The commits since the last audit are new work, not a fix round, so there are no fix notes.
+
+- Findings the last audit left open: $q/standing.md
+- Fix notes: none
+- Diff of the commits since that audit: $q/diff.patch
+- Spec: $RUN/spec.md
+- Gate log ($gate_verdict): $q/gate.log
+EOF
+    why="$(reviewer_failure "$q/carry.md" "$RECHECK_RE")"
+    [[ -z "$why" ]] || qa_pause "The check of the last audit's open findings produced no report: $why"
+  fi
+
+  findings="$q/open-0.md"
+  {
+    grep -hE '^- \[(BLOCKER|IMPORTANT|MINOR)\]' "$q/spec-axis.md" "$q/tests-axis.md" "$q/code-axis.md" || true
+    if [[ -f "$q/carry.md" ]]; then { grep -hE '^- \[(OPEN|NEW)\]' "$q/carry.md" || true; } | sed -E 's/^- \[(OPEN|NEW)\] /- /'; fi
+    if [[ "$QA_MODE" == followup && -f "$q/standing.md" ]]; then grep -hE '^- \[MINOR\]' "$q/standing.md" || true; fi
+    if [[ "$gate_verdict" == FAIL ]]; then echo "- [BLOCKER] gate — the verify command fails on the integration branch — see $q/gate.log — make it pass"; fi
+  } | awk '!seen[$0]++' > "$findings"   # a finding carried over and found again is listed once
+  open="$(count_open "$BLOCKING_RE" "$findings")"
 
   r=0
   while (( open > 0 && r < FORGE_QA_MAX_ROUNDS )); do
-    usage_check; halted && qa_pause "$(cat "$RUN/halt")"
-    r=$((r + 1)); local fixbase; fixbase="$(git -C "$INT" rev-parse HEAD)"
-    log "QA: $open blocking finding(s); fix round $r/$FORGE_QA_MAX_ROUNDS"
-    render "$FORGE_HOME/prompts/qa-fix.md" "CONSTITUTION=$CONSTITUTION" "FINDINGS=$findings" "SPEC=$RUN/spec.md" \
-        "SLICES=$RUN/qa/slices.md" "VERIFY_CMD=$(gate_text "$INT")" "NOTES=$RUN/qa/fix-$r.md" "ROUND=$r" \
-      | agent "$INT" "$FORGE_MODEL_ESCALATE" "$RUN/qa/fix-agent-$r.log"
-    why="$(agent_failure "$RUN/qa/fix-agent-$r.log")"
-    [[ -z "$why" ]] || qa_pause "Fix round $r did not run: $why"
-    [[ -f "$RUN/qa/fix-$r.md" ]] || echo "(the fixer wrote no notes)" > "$RUN/qa/fix-$r.md"
-    gate_verdict=PASS; int_gate "$RUN/qa/gate.log" || gate_verdict=FAIL
-    git -C "$INT" diff -U10 "$fixbase..HEAD" > "$RUN/qa/fix-$r.patch"
-    cat <<EOF | reviewer qa-recheck "$FORGE_MODEL_QA" "$RUN/qa/recheck-$r.md"
+    r=$((r + 1))
+    if [[ -f "$q/open-$r.md" ]]; then   # this round finished before the pause
+      findings="$q/open-$r.md"; gate_verdict="$(cat "$q/fix-$r.gate")"; open="$(count_open "$BLOCKING_RE" "$findings")"
+      continue
+    fi
+    if [[ ! -f "$q/fix-$r.head" ]]; then
+      usage_check; halted && qa_pause "$(cat "$RUN/halt")"
+      note=""; retry=""
+      if [[ -f "$q/fix-$r.base" ]]; then
+        retry=".retry-$(date +%H%M%S)"
+        note="
+This round was started before and interrupted. What it committed is kept: \`git log $(cat "$q/fix-$r.base")..HEAD\` lists it, and \`git status\` shows anything it left uncommitted, which you finish or discard. A finding those commits already fix needs only its line in the notes. If the notes file exists, keep its lines and add the missing ones."
+        log "QA: fix round $r was interrupted; its commits are kept and the round continues"
+      else
+        git -C "$INT" rev-parse HEAD > "$q/fix-$r.base"
+        log "QA: $open blocking finding(s); fix round $r/$FORGE_QA_MAX_ROUNDS"
+      fi
+      { render "$FORGE_HOME/prompts/qa-fix.md" "CONSTITUTION=$CONSTITUTION" "FINDINGS=$findings" "SPEC=$RUN/spec.md" \
+          "SLICES=$q/slices.md" "VERIFY_CMD=$(gate_text "$INT")" "NOTES=$q/fix-$r.md" "ROUND=$r"
+        printf '%s\n' "$note"; } | agent "$INT" "$FORGE_MODEL_ESCALATE" "$q/fix-agent-$r$retry.log"
+      why="$(agent_failure "$q/fix-agent-$r$retry.log")"
+      [[ -z "$why" ]] || qa_pause "Fix round $r did not finish: $why"
+      [[ -f "$q/fix-$r.md" ]] || echo "(the fixer wrote no notes)" > "$q/fix-$r.md"
+      git -C "$INT" rev-parse HEAD > "$q/fix-$r.head"
+    fi
+    if [[ ! -f "$q/fix-$r.gate" ]]; then
+      gate_verdict=PASS; int_gate "$q/gate.log" || gate_verdict=FAIL
+      qa_diff "$(cat "$q/fix-$r.base")..HEAD" > "$q/fix-$r.patch"
+      echo "$gate_verdict" > "$q/fix-$r.gate"
+    fi
+    gate_verdict="$(cat "$q/fix-$r.gate")"
+    if [[ -n "$(reviewer_failure "$q/recheck-$r.md" "$RECHECK_RE")" ]]; then
+      usage_check; halted && qa_pause "$(cat "$RUN/halt")"
+      cat <<EOF | reviewer qa-recheck "$FORGE_MODEL_QA" "$q/recheck-$r.md"
 Re-review fix round $r.
 
 - Findings that were open: $findings
-- Fix notes: $RUN/qa/fix-$r.md
-- Fix diff: $RUN/qa/fix-$r.patch
+- Fix notes: $q/fix-$r.md
+- Fix diff: $q/fix-$r.patch
 - Spec: $RUN/spec.md
-- Gate log after the fixes ($gate_verdict): $RUN/qa/gate.log
+- Gate log after the fixes ($gate_verdict): $q/gate.log
 EOF
-    why="$(reviewer_failure "$RUN/qa/recheck-$r.md" '^- \[(ADDRESSED|OPEN|PARKED|NEW)\]')"
-    [[ -z "$why" ]] || qa_pause "The recheck of fix round $r produced no report: $why"
-    { grep -hE '^- \[PARKED\]' "$RUN/qa/recheck-$r.md" || true; } >> "$RUN/qa/parked.md"
-    findings="$RUN/qa/open-$r.md"
-    { grep -hE '^- \[(OPEN|NEW)\]' "$RUN/qa/recheck-$r.md" || true; } | sed -E 's/^- \[(OPEN|NEW)\] /- /' > "$findings"
-    { grep -hE '^- \[MINOR\]' "$RUN/qa/open-0.md" || true; } >> "$findings"
-    [[ "$gate_verdict" == FAIL ]] && echo "- [BLOCKER] gate — the verify command still fails after fix round $r — see $RUN/qa/gate.log" >> "$findings"
-    open="$(count_open '^- \[(BLOCKER|IMPORTANT)\]' "$findings")"
+      why="$(reviewer_failure "$q/recheck-$r.md" "$RECHECK_RE")"
+      [[ -z "$why" ]] || qa_pause "The recheck of fix round $r produced no report: $why"
+    fi
+    {
+      { grep -hE '^- \[(OPEN|NEW)\]' "$q/recheck-$r.md" || true; } | sed -E 's/^- \[(OPEN|NEW)\] /- /'
+      grep -hE '^- \[MINOR\]' "$q/open-0.md" || true
+      if [[ "$gate_verdict" == FAIL ]]; then echo "- [BLOCKER] gate — the verify command still fails after fix round $r — see $q/gate.log"; fi
+    } > "$q/open-$r.md.part"
+    mv "$q/open-$r.md.part" "$q/open-$r.md"   # the round's checkpoint
+    findings="$q/open-$r.md"
+    open="$(count_open "$BLOCKING_RE" "$findings")"
   done
 
+  # Everything below is rebuilt from the stage files, so a pause here repeats it harmlessly.
+  { cat "$q/carried-parked.md" 2>/dev/null || true
+    grep -hE '^- \[PARKED\]' "$q"/carry.md "$q"/recheck-*.md 2>/dev/null || true; } > "$q/parked.md"
   write_report "$gate_verdict" "$findings" "$r" "$open"
+  { printf '### Audit of %s..%s, %s\n\n' "${QA_FROM:0:12}" "${QA_PIN:0:12}" "$(date +%F)"
+    qa_evidence | sed 's/^### /#### /'
+    cat "$q/carried-history.md" 2>/dev/null || true; } > "$q/history.md"
+  cp "$findings" "$q/standing.md"; cp "$q/report.md" "$q/last-report.md"
+  printf '%s %s %s\n' "$(git -C "$INT" rev-parse HEAD)" "$base" "$key" > "$q/audited.part"; mv "$q/audited.part" "$q/audited"
   ledger "qa: finished after $r fix round(s), $open blocking finding(s) open, gate $gate_verdict"
-  log "QA: report at $RUN/qa/report.md ($open blocking finding(s) open, gate $gate_verdict)"
+  log "QA: report at $q/report.md ($open blocking finding(s) open, gate $gate_verdict)"
   finalize_pr
+  rm -f "$q/scope"
+}
+
+# The evidence of the audit in progress: each reviewer's report, then each fix round.
+qa_evidence() {
+  local f
+  for f in spec tests code; do
+    echo "### ${f^} axis"; echo; cat "$RUN/qa/$f-axis.md" 2>/dev/null || echo "(no report)"; echo
+  done
+  if [[ -f "$RUN/qa/carry.md" ]]; then
+    echo "### The last audit's open findings, against the new commits"; echo; cat "$RUN/qa/carry.md"; echo
+  fi
+  for f in "$RUN"/qa/recheck-*.md; do
+    [[ -f "$f" ]] || continue
+    echo "### Fix round $(basename "$f" .md | cut -d- -f2)"; echo
+    echo "Fix notes:"; echo; cat "${f/recheck-/fix-}" 2>/dev/null; echo; echo "Recheck:"; echo; cat "$f"; echo
+  done
 }
 
 # The report is a brief: what needs the human's decision first, evidence after.
@@ -814,6 +1034,10 @@ write_report() { # <gate verdict> <open findings file> <rounds> <open count>
     echo
     echo "Branch \`$INT_BRANCH\` · $(git -C "$INT" rev-list --count "$(git -C "$INT" merge-base "$FORGE_BASE_BRANCH" HEAD)..HEAD") commits · gate **$1** · $3 fix round(s) · **$4** blocking finding(s) open"
     echo
+    if [[ "$QA_MODE" == followup ]]; then
+      echo "A follow-up audit: the reviewers read the $(git -C "$INT" rev-list --count "$QA_FROM..$QA_PIN") commit(s) since the last audit (\`${QA_FROM:0:12}..${QA_PIN:0:12}\`), and what that audit left open was judged against them. \`forge qa $SPEC --full\` audits the whole branch again."
+      echo
+    fi
     echo "## Needs your decision"
     echo
     echo "### Slices that did not merge"
@@ -834,7 +1058,7 @@ write_report() { # <gate verdict> <open findings file> <rounds> <open count>
     if [[ -s "$RUN/qa/parked.md" ]]; then cat "$RUN/qa/parked.md"; else echo "- none"; fi
     echo
     echo "### Rulings: decisions the agents made on your behalf"
-    { grep -hE '^- Ruling:' "$RUN"/slices/*/state.md "$RUN"/qa/fix-*.md 2>/dev/null || echo "- none"; }
+    { grep -hE '^- Ruling:' "$RUN"/slices/*/state.md "$RUN"/qa/fix-[0-9]*.md "$RUN/qa/carried-history.md" 2>/dev/null || echo "- none"; }
     echo
     echo "### Minor findings (not fixed)"
     { grep -E '^- \[MINOR\]' "$2" || echo "- none"; }
@@ -849,14 +1073,8 @@ write_report() { # <gate verdict> <open findings file> <rounds> <open count>
     echo
     echo "## Audit"
     echo
-    for f in spec tests code; do
-      echo "### ${f^} axis"; echo; cat "$RUN/qa/$f-axis.md" 2>/dev/null || echo "(no report)"; echo
-    done
-    for f in "$RUN"/qa/recheck-*.md; do
-      [[ -f "$f" ]] || continue
-      echo "### Fix round $(basename "$f" .md | cut -d- -f2)"; echo
-      echo "Fix notes:"; echo; cat "${f/recheck-/fix-}" 2>/dev/null; echo; echo "Recheck:"; echo; cat "$f"; echo
-    done
+    qa_evidence
+    if [[ -s "$RUN/qa/carried-history.md" ]]; then echo "## Earlier audits"; echo; cat "$RUN/qa/carried-history.md"; fi
   } > "$RUN/qa/report.md"
 }
 
@@ -985,8 +1203,12 @@ cmd_run() {
     exit 75
   fi
   if (( SKIP_QA )); then log "QA skipped (--skip-qa)"
-  elif (( merged_now == 0 )) && [[ -f "$RUN/qa/report.md" ]]; then log "nothing new merged; the existing QA report stands"
-  else cmd_qa; fi
+  elif (( merged_now == 0 && ! QA_FULL )) && audit_complete; then log "nothing new merged; the existing QA report stands"
+  else
+    # New merges end an audit that was paused: the next one covers them too.
+    (( merged_now == 0 )) || rm -f "$RUN/qa/scope"
+    cmd_qa
+  fi
   cmd_cleanup
 }
 
@@ -1038,6 +1260,7 @@ main() {
       --yolo) YOLO=1 ;;
       --local) LOCAL=1 ;;
       --skip-qa) SKIP_QA=1 ;;
+      --full) QA_FULL=1 ;;
       --max-parallel) shift; FORGE_MAX_PARALLEL="${1:?--max-parallel needs a number}" ;;
       --log) shift; logfile="${1:?--log needs a file}" ;;
       -*) die "unknown option: $1" ;;

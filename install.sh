@@ -23,8 +23,15 @@ put() { # <source> <destination>
 echo "Forge project files in $target:"
 put "$here/templates/config.sh" "$target/.forge/config.sh"
 put "$here/templates/constitution.md" "$target/.forge/constitution.md"
-if [[ ! -e "$target/.forge/.gitignore" ]]; then
-  printf 'runs/\nworktrees/\n' > "$target/.forge/.gitignore"; echo "  created  .forge/.gitignore"
+# What Forge writes under .forge/ and nobody commits. An existing file gains
+# the lines it lacks and keeps everything else.
+ignore="$target/.forge/.gitignore"; had=0; added=""
+[[ -e "$ignore" ]] && had=1
+for d in runs worktrees qa handoffs reports; do
+  grep -qxF "$d/" "$ignore" 2>/dev/null || { printf '%s/\n' "$d" >> "$ignore"; added+=" $d/"; }
+done
+if (( ! had )); then echo "  created  .forge/.gitignore"
+elif [[ -n "$added" ]]; then echo "  updated  .forge/.gitignore (added$added)"
 else echo "  kept     .forge/.gitignore"; fi
 
 bin="${FORGE_BIN_DIR:-$HOME/.local/bin}"

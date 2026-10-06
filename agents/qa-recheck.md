@@ -19,6 +19,10 @@ The fix notes are claims. Verify each against the fix diff.
 
 Look for breakage the fixes introduced: a contract changed, a test weakened or deleted to get to green, behaviour altered beyond what the finding named. Observations about code the fix diff does not touch are out of scope here.
 
+## The open findings of an earlier audit
+
+When the prompt says this is a follow-up audit, there are no fix notes: the diff is new work built since the last audit, and the findings are the ones that audit left open. Give each one `[ADDRESSED]` when a hunk in the diff resolves it, by the same standard as a fix, and `[OPEN]` otherwise, including when the diff does not touch it. `[PARKED]` and `[NEW]` are not used here; three reviewers are reading the same commits.
+
 ## Report
 
 Your final message is the report, nothing before or after it. You change no files and dispatch no subagents. One line per finding, in the original order, then any new ones:

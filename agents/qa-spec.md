@@ -28,6 +28,10 @@ If the diff changes `FORGE_VERIFY_CMD` in `.forge/config.sh`, check it against t
 
 **4. Silence.** Where the spec says nothing, a reasonable user's expectation is the requirement. Flag behaviour that would surprise that user (data lost on a common error path, an action with no feedback), graded by its effect on them.
 
+## A follow-up audit
+
+When the prompt says this is a follow-up audit, the diff holds only the commits since the last audit, and the prompt gives that audit's report. Give a verdict to every criterion the new commits implement or touch. Carry every other criterion into the table with its earlier verdict, marked `(earlier audit)`, without deriving it again; open one again only when the new commits change the code its evidence cites. Scope, decisions and silence are judged on the new commits. Findings the earlier audit left open are checked separately: do not repeat them.
+
 ## Severity
 
 - `BLOCKER`: a criterion `FAILED`; a decision or ADR contradicted; data loss or corruption.

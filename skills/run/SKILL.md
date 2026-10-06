@@ -42,7 +42,7 @@ A run that paused, failed or was interrupted has had no cleanup pass. What it st
 
 ## If the run pauses
 
-The script exits with status 75 and the line `paused: <reason>` when it stops itself: a usage limit was reached, the usage threshold was crossed, or an agent call failed outright. A pause is not a failure of the work. Every slice keeps its state, nothing is parked, and an audit that could not finish is reported as incomplete, never as clean. `forge status <spec>` shows the reason. Run `forge run <spec>` again once the cause has cleared (for a usage limit, after it resets).
+The script exits with status 75 and the line `paused: <reason>` when it stops itself: a usage limit was reached, the usage threshold was crossed, or an agent call failed outright. A pause is not a failure of the work. Every slice keeps its state, nothing is parked, and an audit that could not finish is reported as incomplete, never as clean. `forge status <spec>` shows the reason. Run `forge run <spec>` again once the cause has cleared (for a usage limit, after it resets). A paused audit resumes at the stage that was cut off: the reviewer reports and fix-round steps that finished are kept.
 
 ## If a slice is parked
 

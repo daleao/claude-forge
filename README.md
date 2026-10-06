@@ -166,11 +166,11 @@ What happens, without you:
 4. **The Ralph loop, per slice.** A fresh headless `claude -p` context reads the constitution, the ticket, the slice's **state file** and the spec, then builds increments test-first: red, green, commit, record in the state file. When the context guard warns that the window is filling, it checkpoints and ends; a new context picks up from the state file. This repeats until the agent sets `Status: done`.
 5. **The gate.** The script does not take "done" on trust: it runs `FORGE_VERIFY_CMD` itself. Red means the slice is reopened with the failing output written into its state file.
 6. **Merge.** A done slice is merged into the integration branch. Conflicts go to a resolver agent; the gate runs again on the merged result, and a red gate gets one fix attempt before the merge is undone.
-7. **QA.** Three reviewers run in parallel, read-only, each from the diff and the spec, none shown the implementers' notes: **spec** (is each criterion really met: exists, substantive, wired), **tests** (would the tests catch the requirements breaking), **code** (standards, design lenses, regressions, safety). Blocking findings go to one fixer, then a scoped recheck, for at most `FORGE_QA_MAX_ROUNDS` rounds.
+7. **QA.** Three reviewers run in parallel, read-only, each from the diff and the spec, none shown the implementers' notes: **spec** (is each criterion really met: exists, substantive, wired), **tests** (would the tests catch the requirements breaking), **code** (standards, design lenses, regressions, safety). Blocking findings go to one fixer, then a scoped recheck, for at most `FORGE_QA_MAX_ROUNDS` rounds. Lock files are named in the diff but their content is left out (`FORGE_QA_DIFF_EXCLUDE`). The audit after a later run reads only the commits since the last one, and judges what that audit left open against them; `--full` audits the whole branch again.
 8. **PR.** A draft PR is opened at the first merge and updated at the end with the report. It is marked ready when every slice merged.
 9. **Cleanup.** The record of what a run leaves on the machine is written ahead, not recalled. Before an agent creates anything outside its worktree (a container, a volume, a running process, a temp file, a cache, a downloaded browser), it records the intent: what it is about to create, with which command, and how to remove it. The script does the same for its worktrees and setup command. Under that, a hook writes every Bash command an agent runs to a journal before the command runs, so a footprint the agent never recorded can still be found, and a command that cannot be journaled does not run. Both are on disk at once and join one registry, `.forge/runs/42/cleanup-registry.md`, however the agent call ends; a killed run's records are swept in by the next `forge run` or `forge cleanup`. When the run ends, a cleanup agent checks each record against the machine, removes what is safe, and writes its reasoning back to the registry. What it judges unsafe (anything outside `.forge/`, anything shared, data, installed packages) it leaves alone and writes to `.forge/runs/42/cleanup-manual.md`, with what it is, why it was left, and the command to remove it.
 
-**If usage runs out mid-run**, the script pauses instead of failing. A failed agent call (usage limit, network, crash) is told apart from an agent that made no progress: nothing is parked, each running slice stops before its next iteration with its state intact, and the script exits with status 75 and a `paused:` line. An audit that could not finish is reported as **incomplete**, never as clean, and the PR is left as it was. Run `forge run 42` again after the limit resets and it continues where it stopped.
+**If usage runs out mid-run**, the script pauses instead of failing. A failed agent call (usage limit, network, crash) is told apart from an agent that made no progress: nothing is parked, each running slice stops before its next iteration with its state intact, and the script exits with status 75 and a `paused:` line. An audit that could not finish is reported as **incomplete**, never as clean, and the PR is left as it was. Run `forge run 42` again after the limit resets and it continues where it stopped. That holds inside the audit too: each reviewer's report and each step of a fix round is kept as it finishes, so only the step that was cut off runs again, and a fixer that was cut off keeps its commits.
 
 To pause *before* the limit, use `forge-usage-statusline` as your status line (`/forge:setup` offers to add it); the threshold, `FORGE_USAGE_STOP_PERCENT`, defaults to 90. Claude Code reports the 5-hour and 7-day percentages only to the status line, only in interactive sessions, and only on Pro and Max plans, so the reading is as fresh as your last interactive activity; a reading older than `FORGE_USAGE_MAX_AGE` (15 minutes) is ignored and the script says so. The check runs before every slice start, every iteration, and every audit step.
 
@@ -184,7 +184,8 @@ Watching and steering:
 forge status 42               # each slice: status, and what parked or blocks it
 forge unblock 42 57           # after editing slice 57's state.md with your answer
 forge run 42                  # resumes: merged slices are kept
-forge qa 42                   # re-run the QA phase alone
+forge qa 42                   # resume a paused audit, or audit what is new since the last one
+forge qa 42 --full            # audit the whole branch again from the start
 forge cleanup 42              # run the cleanup pass (a paused or interrupted run has had none)
 ```
 
@@ -199,7 +200,7 @@ The agent starts with what the run left on your machine: what the cleanup pass r
 Then it briefs you from the report, decisions first: slices that didn't merge, findings still open, findings the fixer declined (with both sides), and every ruling. Then the questions no audit answers: is this what you wanted, does it behave right when you use it, are the trade-offs acceptable, would you maintain it.
 
 - Small corrections are made on the spot, test-first.
-- Bigger rework becomes new slices appended to the spec; `forge run 42` builds only those and re-audits.
+- Bigger rework becomes new slices appended to the spec; `forge run 42` builds only those and audits only what they added.
 - When you're satisfied, merge the PR (its `Closes` lines resolve the issues), then `forge clean 42`.
 
 Afterwards, `/forge:retro 42` turns the run's stalls, rulings and QA findings into improvements to the agents' environment: a new check in the gate, a constitution rule, a slicing habit.
@@ -288,11 +289,13 @@ LINEAGE.md                   where each part came from, and why it is the way it
 | `FORGE_MAX_ITERATIONS` | 10 | fresh contexts per slice before it is parked |
 | `FORGE_STALL_LIMIT` | 2 | no-progress iterations before escalating the model; again before parking |
 | `FORGE_QA_MAX_ROUNDS` | 2 | QA fix-and-recheck rounds |
+| `FORGE_QA_DIFF_EXCLUDE` | the usual lock files | git glob pathspecs whose content is left out of the diff the reviewers read; the file is still listed. Setting it replaces the default; `()` leaves nothing out |
 | `FORGE_MODEL_IMPLEMENT` / `_ESCALATE` / `_QA` | `sonnet` / `opus` / `opus` | model per role |
 | `FORGE_MODEL_CLEANUP` | same as `FORGE_MODEL_QA` | model for the cleanup pass |
 | `FORGE_CLEANUP_TOOLS` | empty; the config template sets it to: inspect Docker and processes, stop and remove containers and networks | everything the cleanup pass may run besides reading files, `--yolo` or not; a removal outside this list becomes a manual step |
 | `FORGE_USAGE_STOP_PERCENT` | 90 | pause when 5-hour or 7-day usage reaches this percentage; `""` switches it off |
 | `FORGE_USAGE_MAX_AGE` | 900 | seconds before a usage reading is treated as stale and ignored |
+| `FORGE_NOTIFY_CMD` | empty | run when a slice is blocked or the run pauses, with a title as `$1` and the message as `$2`. Empty uses the desktop notifier (`notify-send`, or `osascript` on macOS); `:` switches notifications off |
 | `FORGE_ALLOWED_TOOLS` | file tools and basic git | what agents may do without `--yolo`; the commands your gate and setup commands start with are added automatically |
 | `FORGE_CTX_WARN` / `FORGE_CTX_CRITICAL` | 100000 / 140000 | context guard thresholds in tokens: finish the increment, then checkpoint now |
 

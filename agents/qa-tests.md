@@ -29,6 +29,10 @@ You have not been given the implementers' notes, on purpose.
 
 You do not re-run the suite; the gate log is that evidence. Where reading raises a doubt a focused run would settle, name the test you would run.
 
+## A follow-up audit
+
+When the prompt says this is a follow-up audit, the diff holds only the commits since the last audit, and the prompt gives that audit's report. Find the guarding test for every criterion the new commits implement or touch, and judge every test they add or change. Carry every other criterion into the table from the earlier report, marked `(earlier audit)`; open one again only when the new commits change its test or the code under it. Findings the earlier audit left open are checked separately: do not repeat them.
+
 ## Severity
 
 - `BLOCKER`: a criterion no test would catch breaking; a hollow or tautological test standing in as a criterion's only cover.

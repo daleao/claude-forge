@@ -37,6 +37,13 @@ FORGE_STALL_LIMIT=2
 # Audit: fix-and-recheck rounds before residual findings go to the human.
 FORGE_QA_MAX_ROUNDS=2
 
+# Audit: paths whose content is left out of the diff the reviewers read (they
+# still see that the file changed, and can open it). Each entry is a git glob
+# pathspec. Unset = the usual lock files (package-lock.json, pnpm-lock.yaml,
+# yarn.lock, Cargo.lock, go.sum and the like). Set it to add generated code;
+# the list you set replaces the default, and () leaves nothing out.
+#FORGE_QA_DIFF_EXCLUDE=("**/pnpm-lock.yaml" "src/generated/**")
+
 # Pause the run when subscription usage (5-hour or 7-day window) reaches this
 # percentage. "" = off. It takes effect once `forge-usage-statusline` is your
 # Claude Code status line, and only while its readings are fresh (see
@@ -82,3 +89,10 @@ FORGE_CLEANUP_TOOLS=(
   "Bash(docker stop:*)" "Bash(docker rm:*)" "Bash(docker network rm:*)"
   "Bash(pgrep:*)"
 )
+
+# Run when a slice is blocked or the run pauses, so you hear of it with no
+# session open. It gets a title as $1 and the message as $2. Left empty, the
+# desktop notifier is used (notify-send, or osascript on macOS). Set it to ":"
+# for no notifications. Example, to a phone through ntfy.sh:
+#   FORGE_NOTIFY_CMD='curl -s -H "Title: $1" -d "$2" https://ntfy.sh/<your topic>'
+FORGE_NOTIFY_CMD=""
