@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stub gh: issues come from $FORGE_TEST_ISSUES/<n>.json; everything else succeeds.
+if [[ "$1 $2" == "issue view" ]]; then
+  f="$FORGE_TEST_ISSUES/$3.json"; [[ -f "$f" ]] || exit 1
+  case " $* " in
+    *" -q .state "*) jq -r .state "$f" ;;
+    *) cat "$f" ;;
+  esac
+fi
+exit 0

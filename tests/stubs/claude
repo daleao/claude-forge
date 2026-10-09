@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Stub claude. Every call leaves <n>.args (one argument per line), <n>.kind and,
+# for a headless call, <n>.prompt in $FORGE_TEST_CALLS. What it does:
+#   mcp get <server>     prints $FORGE_TEST_MCP_STATUS
+#   -p --agent forge:*   prints a clean report of that reviewer's kind (the code
+#                        reviewer has one blocker when FORGE_TEST_FINDING is set)
+#   -p, in a slice       commits the files a slice would (see below), sets its state to done
+#   -p, anywhere else    nothing (a fixer or the cleanup pass with nothing to do)
+set -u
+mkdir -p "$FORGE_TEST_CALLS"
+n="$(find "$FORGE_TEST_CALLS" -name '*.args' | wc -l | tr -d ' ')"; n="$FORGE_TEST_CALLS/$(printf '%03d' "$n")-$$"
+printf '%s\n' "$@" > "$n.args"
+if [[ "${1:-}" == mcp ]]; then echo mcp > "$n.kind"; printf '%s:\n  Status: %s\n' "${3:-}" "${FORGE_TEST_MCP_STATUS:-✔ Connected}"; exit 0; fi
+cat > "$n.prompt"
+agent=""; prev=""
+for a in "$@"; do [[ "$prev" == --agent ]] && agent="$a"; prev="$a"; done
+case "$agent" in
+  forge:qa-recheck) echo recheck > "$n.kind"; echo "- [ADDRESSED] a finding — file:1" ;;
+  forge:qa-code) echo code > "$n.kind"; printf '### Findings\n'
+    if [[ -n "${FORGE_TEST_FINDING:-}" ]]; then echo "- [BLOCKER] f:1 — wrong — a rule — fix it"; else echo "- none"; fi ;;
+  forge:qa-*) echo "${agent#forge:qa-}" > "$n.kind"; printf '### Findings\n- none\n' ;;
+  *)
+    if [[ -n "${FORGE_STATE_FILE:-}" ]]; then
+      echo implement > "$n.kind"
+      # The slice's work: a file, a rule of its own at the end of the
+      # constitution, and an attempt to widen the reviewers' tools from its checkout.
+      echo work > "work-$(basename "$PWD").txt"
+      if [[ -f .forge/constitution.md ]]; then echo "- Rule added by the slice." >> .forge/constitution.md; fi
+      echo 'FORGE_QA_TOOLS=("Edit" "Write")' >> .forge/config.sh
+      git add -A >/dev/null && git commit -qm "slice work"
+      sed -i 's/^Status: .*/Status: done/' "$FORGE_STATE_FILE"
+    else echo other > "$n.kind"; fi ;;
+esac
+exit 0

@@ -1,7 +1,7 @@
 ---
 name: qa-code
 description: QA audit, code axis. Reviews a branch's diff for standards, design, regressions and safety. Dispatched by the forge loop or the /forge:qa skill with paths to the diff, the constitution, and the lens directory.
-tools: Read, Grep, Glob, Bash
+disallowedTools: Edit, Write, NotebookEdit, Agent
 ---
 
 You review the code on a finished branch: how it is built, not whether it is the right feature (another reviewer has the spec). You receive a diff, so you carry no exploration cost; that is why the standards are enforced here and not during implementation.
@@ -41,6 +41,10 @@ A repo document overrides a lens or a smell where they disagree. Skip anything t
 - **Accidental complexity**: code that could do the same job with fewer concepts.
 - **Errors**: failures swallowed, or surfaced with nothing to diagnose them by.
 
+## Outside authorities
+
+The constitution may name an outside authority for a kind of fact: an MCP server, a published specification. Where it does, every such fact the diff relies on (an endpoint, a field name, a limit, an error code) is checked against that authority with the tools you were given, never against memory or against what the code assumes. A fact the authority contradicts is a finding, at the severity of what breaks; an unchecked one is an `IMPORTANT` finding. A fact you could not check (no tool for it, the call was denied or failed, the authority does not cover it) is reported as `UNCHECKED` with the reason, never as passed.
+
 ## A follow-up audit
 
 When the prompt says this is a follow-up audit, the diff holds only the commits since the last audit, and the prompt gives that audit's report. Review the new commits. The earlier report is background: it tells you what was already judged, and its findings are checked separately, so do not repeat them.
@@ -63,6 +67,11 @@ Your final message is the report, nothing before or after it. You change no file
 - [BLOCKER] <file:line> — <what is wrong> — <the rule or risk, cited> — <how to fix>
 - [IMPORTANT] ...
 - [MINOR] ...
+
+### Checked against outside authorities
+- CONFIRMED <the fact, and where the diff relies on it> — <the authority, and what you looked up>
+- CONTRADICTED <the fact> — <what the authority says instead>
+- UNCHECKED <the fact> — <why it could not be checked>
 ```
 
 Every finding starts its line with `- [SEVERITY]` exactly. Write `- none` under a heading with nothing to report.

@@ -83,7 +83,7 @@ load_config() {
   git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
   REPO="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
   [[ -f "$REPO/.forge/config.sh" ]] || die "no .forge/config.sh in $REPO (run /forge:setup)"
-  FORGE_ALLOWED_TOOLS=(); FORGE_CLEANUP_TOOLS=(); unset FORGE_QA_DIFF_EXCLUDE
+  FORGE_ALLOWED_TOOLS=(); FORGE_QA_TOOLS=(); FORGE_CLEANUP_TOOLS=(); unset FORGE_QA_DIFF_EXCLUDE
   # shellcheck disable=SC1091
   source "$REPO/.forge/config.sh"
   : "${FORGE_VERIFY_CMD:=}" "${FORGE_SETUP_CMD:=}"
@@ -102,7 +102,7 @@ load_config() {
   # objects to that alongside an installed copy, set FORGE_NO_PLUGIN_DIR=1.
   PLUGIN_ARGS=(--plugin-dir "$FORGE_HOME"); [[ -z "${FORGE_NO_PLUGIN_DIR:-}" ]] || PLUGIN_ARGS=()
   : "${FORGE_MODEL_CLEANUP:=$FORGE_MODEL_QA}"
-  YOLO=0; LOCAL=0; SKIP_QA=0; FOUNDATION=""
+  YOLO=0; LOCAL=0; SKIP_QA=0; FOUNDATION=""; SYNCED=0
   QA_FULL=0; QA_MODE=full; QA_FROM=""; QA_PIN=""
 }
 
@@ -258,6 +258,14 @@ cfg() {
   if [[ -n "$v" ]]; then printf '%s' "$v"; else printf '%s' "${!2:-}"; fi
 }
 
+# constitution_of <worktree>: the constitution an agent working there is given:
+# that checkout's own copy, so a rule committed on the branch reaches the agents
+# on it. The main checkout's copy stands in only where the worktree has none:
+# before it exists, or when the constitution was never committed.
+constitution_of() {
+  if [[ -f "$1/.forge/constitution.md" ]]; then printf '%s' "$1/.forge/constitution.md"; else printf '%s' "$CONSTITUTION"; fi
+}
+
 gate_text() { # <dir>: the gate command as shown to an agent
   local c; c="$(cfg "$1" FORGE_VERIFY_CMD)"
   if [[ -n "$c" ]]; then printf '%s' "$c"
@@ -342,13 +350,16 @@ sweep() {
 }
 
 # reviewer <agent> <model> <outfile>: a read-only headless context whose final
-# message is its report. Prompt on stdin.
+# message is its report. Prompt on stdin. FORGE_QA_TOOLS adds what the project
+# lets a reviewer consult (an MCP server's tools, an exact Bash command); like
+# FORGE_ALLOWED_TOOLS it comes only from the config loaded at start. The agent
+# files themselves take the file-writing tools away, with --yolo or without.
 reviewer() {
   local name="$1" model="$2" out="$3" rc=0
   local -a perms
   rm -f "$out" "$out.rc"   # a call that is killed leaves no report, so the stage runs again
   if (( YOLO )); then perms=(--dangerously-skip-permissions)
-  else perms=(--allowedTools Read Grep Glob "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"); fi
+  else perms=(--allowedTools Read Grep Glob "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "${FORGE_QA_TOOLS[@]}"); fi
   ( cd "$INT" && "$CLAUDE" -p --agent "forge:$name" --model "$model" "${PLUGIN_ARGS[@]}" \
       --add-dir "$RUN" --add-dir "$FORGE_HOME" "${perms[@]}" ) > "$out.part" 2> "$out.err" || rc=$?
   echo "$rc" > "$out.rc"; mv "$out.part" "$out"
@@ -451,7 +462,7 @@ slice_loop() { # <slice>: runs in the background; its verdict is the status file
     i=$((i + 1)); stamp="$(date +%Y%m%d-%H%M%S)"
     before="$(signature "$wt" "$state")"
     log "slice #$s: iteration $i ($model)"
-    render "$FORGE_HOME/prompts/implement.md" "CONSTITUTION=$CONSTITUTION" "TICKET=$dir/ticket.md" \
+    render "$FORGE_HOME/prompts/implement.md" "CONSTITUTION=$(constitution_of "$wt")" "TICKET=$dir/ticket.md" \
         "STATE=$state" "SPEC=$RUN/spec.md" "VERIFY_CMD=$(gate_text "$wt")" \
       | FORGE_STATE_FILE="$state" agent "$wt" "$model" "$dir/iter-$stamp.log"
     # A call that failed (usage limit, network, crash) says nothing about the
@@ -493,7 +504,7 @@ merge_slice() { # <slice>: bring a done slice onto the integration branch, or pa
   local s="$1" dir="$RUN/slices/$1" br="forge/$SPEC/slice-$1" pre title fail
   title="$(title_of "$dir/ticket.md")"
   pre="$(git -C "$INT" rev-parse HEAD)"
-  local -a vars=("SLICE=$s" "TICKET=$dir/ticket.md" "STATE=$dir/state.md" "SPEC=$RUN/spec.md"
+  local -a vars=("SLICE=$s" "TICKET=$dir/ticket.md" "STATE=$dir/state.md" "SPEC=$RUN/spec.md" "CONSTITUTION=$(constitution_of "$INT")"
                  "VERIFY_CMD=$(gate_text "$INT")" "NOTES=$dir/merge-notes.md" "GATE_LOG=$dir/integration-gate.log")
   if ! git -C "$INT" merge --no-ff -m "Merge slice #$s: $title" "$br" > "$dir/merge.log" 2>&1; then
     log "slice #$s: merge conflict; dispatching a resolver"
@@ -696,6 +707,39 @@ edit_hook_refusals() {
   done < <(settings_files "$1")
 }
 
+# mcp_servers <repo>: the MCP servers the config's tool lists name, as
+# mcp__<server>__<tool>. The config is read as text and never sourced (see the
+# front door), so this takes every such name on a line that is not a comment.
+mcp_servers() {
+  { grep -vE '^[[:space:]]*#' "$1/.forge/config.sh" 2>/dev/null || true; } \
+    | { grep -oE 'mcp__[A-Za-z0-9_.-]+' || true; } | sed -E 's/^mcp__//; s/__.*$//' | sort -u
+}
+
+# mcp_problems <repo> <server>: one line for each reason an agent in a worktree
+# would not reach the server. A worktree is a checkout, so only what is
+# committed counts: .mcp.json must declare the server and the project's
+# settings must enable it (yours may do so instead; a "disabled" entry in
+# either wins). Last, `claude mcp get` connects with the stored sign-in, as a
+# headless agent would, without spending a model call.
+mcp_problems() {
+  local f out on=0
+  if ! git -C "$1" show HEAD:.mcp.json 2>/dev/null | jq -e --arg s "$2" '.mcpServers[$s]' >/dev/null 2>&1; then
+    echo "the committed .mcp.json does not declare it (a worktree carries only committed files)"
+  fi
+  if git -C "$1" show HEAD:.claude/settings.json 2>/dev/null \
+      | jq -e --arg s "$2" '.enableAllProjectMcpServers == true or ((.enabledMcpjsonServers // []) | index($s) != null)' >/dev/null 2>&1; then on=1; fi
+  while IFS= read -r f; do
+    if [[ "$f" == "$HOME/.claude/settings.json" ]] && jq -e --arg s "$2" '.enableAllProjectMcpServers == true or ((.enabledMcpjsonServers // []) | index($s) != null)' "$f" >/dev/null 2>&1; then on=1; fi
+    if jq -e --arg s "$2" '(.disabledMcpjsonServers // []) | index($s) != null' "$f" >/dev/null 2>&1; then echo "disabledMcpjsonServers in $f rejects it"; fi
+  done < <(settings_files "$1")
+  (( on )) || echo "the committed .claude/settings.json does not enable it: add it to enabledMcpjsonServers (a worktree has no settings.local.json)"
+  command -v "$CLAUDE" >/dev/null 2>&1 || return 0
+  out="$(cd "$1" && timeout 30 "$CLAUDE" mcp get "$2" 2>&1)" || true
+  grep -q 'Connected' <<<"$out" && return 0
+  out="$({ grep -m1 -E 'Needs authentication|Pending approval|Rejected|Disabled|Failed to connect|Issue:' <<<"$out" || head -n1 <<<"$out"; } | sed -E 's/^[[:space:]]*(Status:)?[[:space:]]*//')"
+  echo "a headless claude does not reach it: ${out:-no answer from \`claude mcp get $2\`}"
+}
+
 cmd_doctor() {
   local c bad=0 repo root line
   local -a missing
@@ -736,6 +780,16 @@ cmd_doctor() {
     echo "         See \"What a run can reach\" in the README."
     bad=1
   else echo "ok       edit hooks: an agent in a worktree can write its run directory"; fi
+  # Each MCP server the tool lists name: can an agent in a worktree reach it?
+  while IFS= read -r c; do
+    mapfile -t missing < <(mcp_problems "$root" "$c")
+    if (( ${#missing[@]} )); then
+      echo "FAIL     MCP server '$c': FORGE_ALLOWED_TOOLS or FORGE_QA_TOOLS allows its tools, but an agent in a worktree cannot call them:"
+      for line in "${missing[@]}"; do echo "         $line"; done
+      echo "         See \"What a run can reach\" in the README."
+      bad=1
+    else echo "ok       MCP server '$c': committed, enabled, and a headless claude connects to it"; fi
+  done < <(mcp_servers "$root")
   return "$bad"
 }
 
@@ -759,8 +813,8 @@ count_open() { { grep -cE "$1" "$2" || true; }; }
 # is left out: a follow-up run appends to it.
 qa_key() {
   { awk '/^## / { skip = (tolower($0) ~ /^## slices[ \t\r]*$/) } !skip' "$RUN/spec.md"
-    cat "$CONSTITUTION" "$FORGE_HOME"/skills/qa/lenses/*.md
-    printf '%s\n' "${FORGE_QA_DIFF_EXCLUDE[@]}"; } 2>/dev/null | git hash-object --stdin || true
+    cat "$(constitution_of "$INT")" "$FORGE_HOME"/skills/qa/lenses/*.md
+    printf '%s\n' "${FORGE_QA_DIFF_EXCLUDE[@]}" "${FORGE_QA_TOOLS[@]}"; } 2>/dev/null | git hash-object --stdin || true
 }
 
 # qa_diff <range>: what a reviewer reads: commit list, stat, full diff with
@@ -790,7 +844,7 @@ Audit the branch checked out in this directory.
 - Slice tickets: $RUN/qa/slices.md
 - Diff (commit list, stat, full diff with context): $RUN/qa/diff.patch
 - Gate log ($1): $RUN/qa/gate.log
-- Constitution: $CONSTITUTION
+- Constitution: $(constitution_of "$INT")
 - Lens directory: $FORGE_HOME/skills/qa/lenses
 EOF
   [[ "$QA_MODE" == followup ]] || return 0
@@ -862,6 +916,7 @@ cmd_qa() {
   local -a todo=()
   git -C "$REPO" show-ref --verify --quiet "refs/heads/$INT_BRANCH" || die "no integration branch for #$SPEC (nothing has run yet)"
   ensure_integration
+  sync_base
   base="$(git -C "$INT" merge-base "$FORGE_BASE_BRANCH" HEAD)"; head="$(git -C "$INT" rev-parse HEAD)"
   [[ "$base" != "$head" ]] || { log "QA: the integration branch has no commits; nothing to audit"; return 0; }
   key="$(qa_key)"
@@ -880,7 +935,7 @@ cmd_qa() {
         fi
         QA_MODE=followup; QA_FROM="$ahead"
       else
-        log "QA: the spec, the constitution, the lenses, the diff exclusions or the base have changed since the last audit; auditing the whole branch"
+        log "QA: the spec, the constitution, the lenses, the diff exclusions, the reviewers' tools or the base have changed since the last audit; auditing the whole branch"
       fi
     fi
     qa_begin "$QA_MODE" "$QA_FROM" "$QA_PIN" "$key"
@@ -923,6 +978,7 @@ A follow-up audit. The commits since the last audit are new work, not a fix roun
 - Fix notes: none
 - Diff of the commits since that audit: $q/diff.patch
 - Spec: $RUN/spec.md
+- Constitution: $(constitution_of "$INT")
 - Gate log ($gate_verdict): $q/gate.log
 EOF
     why="$(reviewer_failure "$q/carry.md" "$RECHECK_RE")"
@@ -957,7 +1013,7 @@ This round was started before and interrupted. What it committed is kept: \`git 
         git -C "$INT" rev-parse HEAD > "$q/fix-$r.base"
         log "QA: $open blocking finding(s); fix round $r/$FORGE_QA_MAX_ROUNDS"
       fi
-      { render "$FORGE_HOME/prompts/qa-fix.md" "CONSTITUTION=$CONSTITUTION" "FINDINGS=$findings" "SPEC=$RUN/spec.md" \
+      { render "$FORGE_HOME/prompts/qa-fix.md" "CONSTITUTION=$(constitution_of "$INT")" "FINDINGS=$findings" "SPEC=$RUN/spec.md" \
           "SLICES=$q/slices.md" "VERIFY_CMD=$(gate_text "$INT")" "NOTES=$q/fix-$r.md" "ROUND=$r"
         printf '%s\n' "$note"; } | agent "$INT" "$FORGE_MODEL_ESCALATE" "$q/fix-agent-$r$retry.log"
       why="$(agent_failure "$q/fix-agent-$r$retry.log")"
@@ -980,6 +1036,7 @@ Re-review fix round $r.
 - Fix notes: $q/fix-$r.md
 - Fix diff: $q/fix-$r.patch
 - Spec: $RUN/spec.md
+- Constitution: $(constitution_of "$INT")
 - Gate log after the fixes ($gate_verdict): $q/gate.log
 EOF
       why="$(reviewer_failure "$q/recheck-$r.md" "$RECHECK_RE")"
@@ -1040,6 +1097,14 @@ write_report() { # <gate verdict> <open findings file> <rounds> <open count>
     fi
     echo "## Needs your decision"
     echo
+    f="$(git -C "$INT" diff "$FORGE_BASE_BRANCH" HEAD -- .forge/constitution.md | sed -n '/^@@/,$p')"
+    if [[ -n "$f" ]]; then
+      echo "### Constitution rules this branch adds, changes or removes"
+      echo
+      echo "\`.forge/constitution.md\`, \`$FORGE_BASE_BRANCH\` against this branch. The agents worked under the branch's version; merging the PR makes it the project's."
+      echo
+      printf '```diff\n%s\n```\n\n' "$f"
+    fi
     echo "### Slices that did not merge"
     any=0
     for s in "${SLICES[@]}"; do
@@ -1136,6 +1201,7 @@ ensure_integration() {
   else
     git -C "$REPO" worktree add -b "$INT_BRANCH" "$INT" "$FORGE_BASE_BRANCH" >/dev/null 2>&1; fresh=1
   fi
+  [[ -f "$INT/.forge/constitution.md" ]] || log "note: .forge/constitution.md is not committed on $INT_BRANCH; agents are given your checkout's copy. Commit it on $FORGE_BASE_BRANCH so the branch carries its own."
   local setup; setup="$(cfg "$INT" FORGE_SETUP_CMD)"
   if [[ -n "$setup" ]] && ! ( cd "$INT" && bash -c "$setup" ) > "$RUN/setup.log" 2>&1; then
     (( greenfield )) || die "setup command failed in the integration worktree (see $RUN/setup.log)"
@@ -1145,6 +1211,29 @@ ensure_integration() {
   gate "$INT" "$RUN/baseline-gate.log" && return 0
   (( greenfield )) || die "the gate is red before any work (see $RUN/baseline-gate.log). Fix $FORGE_BASE_BRANCH first."
   log "no passing gate yet: foundation slice #$FOUNDATION builds the project and defines its gate first; everything else waits for it"
+}
+
+# sync_base: once, when a run or an audit starts, bring the base branch's new
+# commits onto the integration branch, so what the human committed there since
+# (a constitution rule above all) is in every worktree an agent is given. A
+# conflict is the human's to resolve: no agent has read the new rules yet.
+sync_base() {
+  (( ! SYNCED )) || return 0; SYNCED=1
+  local files
+  ! git -C "$INT" merge-base --is-ancestor "$FORGE_BASE_BRANCH" HEAD 2>/dev/null || return 0
+  if [[ -n "$(git -C "$INT" status --porcelain)" ]]; then   # an interrupted fix round; its resume deals with it first
+    log "note: $FORGE_BASE_BRANCH has new commits, but the integration worktree has uncommitted changes; they are merged at the next start"
+    return 0
+  fi
+  if git -C "$INT" merge --no-ff -m "Merge $FORGE_BASE_BRANCH into $INT_BRANCH" "$FORGE_BASE_BRANCH" > "$RUN/base-merge.log" 2>&1; then
+    ledger "base: merged $FORGE_BASE_BRANCH at $(git -C "$REPO" rev-parse --short "$FORGE_BASE_BRANCH")"
+    log "merged the new commits on $FORGE_BASE_BRANCH into $INT_BRANCH"
+    return 0
+  fi
+  files="$(git -C "$INT" diff --name-only --diff-filter=U | paste -sd' ' -)"
+  git -C "$INT" merge --abort 2>/dev/null || true
+  [[ -n "$files" ]] || die "could not merge $FORGE_BASE_BRANCH into $INT_BRANCH (see $RUN/base-merge.log)"
+  die "$FORGE_BASE_BRANCH has new commits that conflict with $INT_BRANCH in: $files. Nothing was started and the merge was undone. Resolve it yourself, then start again: git -C $INT merge $FORGE_BASE_BRANCH"
 }
 
 cmd_run() {
@@ -1164,6 +1253,7 @@ cmd_run() {
   usage_note
 
   ensure_integration
+  sync_base
 
   while :; do
     usage_check

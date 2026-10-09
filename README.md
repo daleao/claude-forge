@@ -161,12 +161,12 @@ or `/forge:run 42` for a preflight and a background launch from inside a session
 What happens, without you:
 
 1. **Snapshot.** The spec and slice issue bodies are copied to `.forge/runs/42/`. Agents read those files, never GitHub, and never issue comments.
-2. **Integration branch.** `forge/42/integration` is cut from your base branch in its own worktree under `.forge/worktrees/`. Your checkout is not touched. The gate must pass here before anything starts.
+2. **Integration branch.** `forge/42/integration` is cut from your base branch in its own worktree under `.forge/worktrees/`. Your checkout is not touched. The gate must pass here before anything starts. Each later `forge run` or `forge qa` first merges the base branch's new commits into it; if they conflict, it stops and names the files, and starts no agent.
 3. **Frontier scheduling.** Every slice whose blockers have merged, and which shares no touched module with a running slice, starts in its own worktree, up to `FORGE_MAX_PARALLEL`. As slices merge, the slices they were blocking start.
 4. **The Ralph loop, per slice.** A fresh headless `claude -p` context reads the constitution, the ticket, the slice's **state file** and the spec, then builds increments test-first: red, green, commit, record in the state file. When the context guard warns that the window is filling, it checkpoints and ends; a new context picks up from the state file. This repeats until the agent sets `Status: done`.
 5. **The gate.** The script does not take "done" on trust: it runs `FORGE_VERIFY_CMD` itself. Red means the slice is reopened with the failing output written into its state file.
 6. **Merge.** A done slice is merged into the integration branch. Conflicts go to a resolver agent; the gate runs again on the merged result, and a red gate gets one fix attempt before the merge is undone.
-7. **QA.** Three reviewers run in parallel, read-only, each from the diff and the spec, none shown the implementers' notes: **spec** (is each criterion really met: exists, substantive, wired), **tests** (would the tests catch the requirements breaking), **code** (standards, design lenses, regressions, safety). Blocking findings go to one fixer, then a scoped recheck, for at most `FORGE_QA_MAX_ROUNDS` rounds. Lock files are named in the diff but their content is left out (`FORGE_QA_DIFF_EXCLUDE`). The audit after a later run reads only the commits since the last one, and judges what that audit left open against them; `--full` audits the whole branch again.
+7. **QA.** Three reviewers run in parallel, read-only (plus any `FORGE_QA_TOOLS`), each from the diff and the spec, none shown the implementers' notes: **spec** (is each criterion really met: exists, substantive, wired), **tests** (would the tests catch the requirements breaking), **code** (standards, design lenses, regressions, safety). Blocking findings go to one fixer, then a scoped recheck, for at most `FORGE_QA_MAX_ROUNDS` rounds. Lock files are named in the diff but their content is left out (`FORGE_QA_DIFF_EXCLUDE`). The audit after a later run reads only the commits since the last one, and judges what that audit left open against them; `--full` audits the whole branch again.
 8. **PR.** A draft PR is opened at the first merge and updated at the end with the report. It is marked ready when every slice merged.
 9. **Cleanup.** The record of what a run leaves on the machine is written ahead, not recalled. Before an agent creates anything outside its worktree (a container, a volume, a running process, a temp file, a cache, a downloaded browser), it records the intent: what it is about to create, with which command, and how to remove it. The script does the same for its worktrees and setup command. Under that, a hook writes every Bash command an agent runs to a journal before the command runs, so a footprint the agent never recorded can still be found, and a command that cannot be journaled does not run. Both are on disk at once and join one registry, `.forge/runs/42/cleanup-registry.md`, however the agent call ends; a killed run's records are swept in by the next `forge run` or `forge cleanup`. When the run ends, a cleanup agent checks each record against the machine, removes what is safe, and writes its reasoning back to the registry. What it judges unsafe (anything outside `.forge/`, anything shared, data, installed packages) it leaves alone and writes to `.forge/runs/42/cleanup-manual.md`, with what it is, why it was left, and the command to remove it.
 
@@ -230,7 +230,7 @@ The project memory hierarchy, and who reads what:
 
 | Layer | Location | Read by |
 | --- | --- | --- |
-| Constitution: permanent engineering rules | `.forge/constitution.md` | every loop iteration; QA code reviewer |
+| Constitution: permanent engineering rules | `.forge/constitution.md`, as committed on the branch being worked on | every loop iteration; the QA reviewers and fixers |
 | Domain: vocabulary | `GLOSSARY.md` | everyone |
 | Decisions | `docs/adr/` | everyone; binding on implementers |
 | Specs and slices | GitHub issues `forge:spec`, `forge:slice` | humans; snapshotted for agents |
@@ -240,6 +240,8 @@ The project memory hierarchy, and who reads what:
 | Manual cleanup: the steps the pass would not take, with instructions | `.forge/runs/<spec>/cleanup-manual.md` | you; `/forge:review`, `/forge:cleanup` |
 | Coding standards (optional) | `CODING_STANDARDS.md` | QA code reviewer only |
 | A class: notebook, glossary, spec, slices, audit report | `.forge/class/<course>/` | `/forge:teach`, at every resume; you |
+
+**Where the constitution is read from.** Never from your checkout's working copy, once a run has worktrees: each agent is given the copy in the worktree it works in. A slice's implementer reads its slice branch's copy; the reviewers, the recheck, the QA fixer and the merge and integration fixers read the integration branch's. (Your checkout's copy is used only if the file was never committed, and the run says so.) To add a rule mid-run, commit it on the base branch: the next `forge run` or `forge qa` merges the base into the integration branch before any agent starts, slices that start afterwards are cut from it, and the audit that follows covers the whole branch under the new rule. A slice already under way keeps the rules it started with until it merges. A rule that a slice itself adds, changes or removes reaches the integration branch when the slice merges, and the report and the PR body show the constitution's diff against the base branch, so it does not pass unread.
 
 `.forge/runs/` and `.forge/worktrees/` are git-ignored. Delete a run directory to forget a run. `.forge/class/` is committed.
 
@@ -297,11 +299,12 @@ LINEAGE.md                   where each part came from, and why it is the way it
 | `FORGE_USAGE_MAX_AGE` | 900 | seconds before a usage reading is treated as stale and ignored |
 | `FORGE_NOTIFY_CMD` | empty | run when a slice is blocked or the run pauses, with a title as `$1` and the message as `$2`. Empty uses the desktop notifier (`notify-send`, or `osascript` on macOS); `:` switches notifications off |
 | `FORGE_ALLOWED_TOOLS` | file tools and basic git | what agents may do without `--yolo`; the commands your gate and setup commands start with are added automatically |
+| `FORGE_QA_TOOLS` | empty | extra tools for the QA reviewers and the recheck, on top of their read-only set: an MCP server's tools (`mcp__<server>__<tool>`, one per entry) or an exact Bash command, for checking the diff against an authority the constitution names. Read only from your checkout's config, like `FORGE_ALLOWED_TOOLS`. Changing it makes the next audit cover the whole branch |
 | `FORGE_CTX_WARN` / `FORGE_CTX_CRITICAL` | 100000 / 140000 | context guard thresholds in tokens: finish the increment, then checkpoint now |
 
 ## Safety
 
-- **Permissions.** By default agents run with `--permission-mode acceptEdits` plus your allowlist; anything else is denied. QA reviewers get read-only tools. `--yolo` removes all checks and is meant for a container or VM.
+- **Permissions.** By default agents run with `--permission-mode acceptEdits` plus your allowlist; anything else is denied. QA reviewers get read-only tools plus `FORGE_QA_TOOLS`, and their agent files remove the file-editing tools outright, so that holds under `--yolo` and when `/forge:qa` dispatches them. `--yolo` removes all checks and is meant for a container or VM.
 - **Untrusted text.** An unattended agent acts on what it reads. The script feeds agents issue *bodies* only, never comments, and snapshots them once. Run it on specs you or people you trust wrote.
 - **Your checkout.** All work happens in worktrees under `.forge/`. The script only ever pushes the integration branch, and never merges into your base branch; you do that, through the PR.
 - **Cleanup.** The cleanup pass removes things from your machine unattended, so its limits do not rest on its judgement alone. It runs from the run directory, cannot edit code, is never given `rm`, and may run only `FORGE_CLEANUP_TOOLS`, even under `--yolo`. Anything it may not run, and anything outside `.forge/`, shared, holding data or installed, is left for you in `cleanup-manual.md`. The registry has two layers: the agents' intents, and a command journal that does not depend on them. What neither covers is not found: what the gate and setup commands leave when the script runs them, and anything an agent runs with the plugin's hooks not loaded.
@@ -318,9 +321,9 @@ Forge works with Claude Code's Bash sandbox switched on, without opening the san
 | `forge issue edit <n> --body-file …` | replace the body of an issue that already carries a `forge:` label |
 | `forge pr view <spec>` | show the run's PR and the files it changes |
 | `forge pr push <spec>` | push `forge/<spec>/integration`, and no other branch |
-| `forge doctor` | check the tools, the GitHub login and the remote, [what a run's agents can reach](#what-a-run-can-reach), and that no stale worktree would stop a run |
+| `forge doctor` | check the tools, the GitHub login and the remote, [what a run's agents can reach](#what-a-run-can-reach) (MCP servers included), and that no stale worktree would stop a run |
 
-They act on the `origin` repository only, take no other flags, and do not read `.forge/config.sh`, so a session cannot steer them with a file it wrote. Anything else on GitHub (creating a repository, merging a PR, deleting labels) you do yourself.
+They act on the `origin` repository only, take no other flags, and never run `.forge/config.sh` (`forge doctor` reads it as text, for the MCP server names), so a session cannot steer them with a file it wrote. Anything else on GitHub (creating a repository, merging a PR, deleting labels) you do yourself.
 
 ### What `install.sh` adds to your settings
 
@@ -366,13 +369,24 @@ A path in `allowWrite` must exist before the run starts. The sandbox can only op
 
 If you have a `PreToolUse` hook that keeps edits inside the project directory, it must also allow the run directory. In a worktree the project directory is `.forge/worktrees/<spec>/<name>`, so `.forge/runs/<spec>/` is outside it, and an agent that cannot write its state file loses the iteration. `forge doctor` runs each such hook from your settings and the project's against a state-file path and reports any that refuses. `forge run` asks the same of each slice before its first iteration, and blocks the slice with the hook's own message instead of spending iterations on it. Neither sees hooks that come from plugins.
 
+**An MCP server.** An agent calls an MCP tool only when four things hold, and `forge doctor` checks the first three for every server named in `FORGE_ALLOWED_TOOLS` or `FORGE_QA_TOOLS`:
+
+| The agent needs | Where |
+| --- | --- |
+| the server declared | the project's committed `.mcp.json` |
+| the server enabled | `enabledMcpjsonServers` (or `enableAllProjectMcpServers`) in the committed `.claude/settings.json`, or in your own `~/.claude/settings.json`; `settings.local.json` does not reach a worktree |
+| a sign-in that works headless | whatever `claude mcp get <server>` needs to report `Connected` from the project directory: a stored OAuth sign-in (run `/mcp` once in a session), or the environment variables the server's entry reads, set where `forge run` starts |
+| the tool allowed | `FORGE_ALLOWED_TOOLS` for implementers and fixers, `FORGE_QA_TOOLS` for the reviewers, one `mcp__<server>__<tool>` entry per tool |
+
+A tool that is not allowed is denied and the agent says so; a reviewer reports the fact it meant to check as unchecked.
+
 An excluded command runs with your full access, and a test command runs code the agent wrote. Once one is excluded, the sandbox no longer keeps an agent away from your network or your GitHub token; it still stops everything the agent runs by other means. If you need that boundary to hold, run Forge inside a virtual machine or a dev container, or give `gh` a token scoped to the one repository.
 
 An excluded command must also be the whole Bash call. `dotnet test apps/api` leaves the sandbox; `cd apps/api && dotnet test`, `dotnet test | tail` and a gate that chains it after a command with no entry of its own all stay inside. Say so in the project's `CLAUDE.md`, so agents run those commands bare.
 
 ## Status
 
-Forge is new. The script has been tested end to end against stub `gh` and `claude` binaries, covering parallel slices, merge conflicts, stalls, pauses and resumes, and the QA rounds; it has had little use against real projects yet. Start with a small spec and `--max-parallel 1`, and expect to tune `FORGE_ALLOWED_TOOLS` and the prompts for your project. Issues and pull requests are welcome.
+Forge is new. The script has been tested end to end against stub `gh` and `claude` binaries, covering parallel slices, merge conflicts, stalls, pauses and resumes, and the QA rounds; it has had little use against real projects yet. `tests/run.sh` runs the part of that which is kept as a suite: the reviewers' tools, where the constitution is read from, the base-branch merge, and `forge doctor`'s MCP checks. Start with a small spec and `--max-parallel 1`, and expect to tune `FORGE_ALLOWED_TOOLS` and the prompts for your project. Issues and pull requests are welcome.
 
 ## Credits
 

@@ -21,7 +21,7 @@ For a spec built by the loop, prefer `forge qa <spec>` from a terminal: it also 
 
 ## 2. Dispatch the three reviewers in parallel
 
-Dispatch `forge:qa-spec`, `forge:qa-tests` and `forge:qa-code` as subagents in one message, leaving out any axis whose report is already in the audit directory. Each prompt carries only paths: the files from step 1, `.forge/constitution.md`, and the lens directory, which is `lenses/` beside this file.
+Dispatch `forge:qa-spec`, `forge:qa-tests` and `forge:qa-code` as subagents in one message, leaving out any axis whose report is already in the audit directory. Each prompt carries only paths: the files from step 1, `.forge/constitution.md`, and the lens directory, which is `lenses/` beside this file. The reviewers cannot edit files, and can call whatever MCP tools this session has, so one the constitution names as an authority is theirs to consult.
 
 Give them the files and nothing else. Your own view of what the branch does, or which findings would be false alarms, stays out of the prompts: a reviewer told what to expect finds it.
 
@@ -36,5 +36,5 @@ Present the three reports under `## Spec`, `## Tests` and `## Code`, verbatim. K
 Offer to fix the blocking findings. If the user agrees:
 
 1. Write the blocking findings to `findings.md` in the audit directory. One subagent gets the whole findings list, with the instructions in `prompts/qa-fix.md` at the plugin root. One fixer for the list, never one per finding.
-2. Run the verify command, then dispatch `forge:qa-recheck` with the findings, the fix notes, and the fix diff. The notes, the fix diff and the recheck's report go in the audit directory too, numbered by round.
+2. Run the verify command, then dispatch `forge:qa-recheck` with the findings, the fix notes, the fix diff, and `.forge/constitution.md`. The notes, the fix diff and the recheck's report go in the audit directory too, numbered by round.
 3. Two rounds at most. What is still open, and anything the recheck parked, goes to the user with both sides stated.

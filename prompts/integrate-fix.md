@@ -5,6 +5,7 @@ Read first:
 1. `{{GATE_LOG}}`: the failing output.
 2. `{{TICKET}}` and `{{STATE}}`: what the slice does, and the decisions behind it.
 3. `{{SPEC}}`: the authority on what the combined behaviour should be.
+4. `{{CONSTITUTION}}`: the engineering rules for this repo.
 
 Call the Skill tool with "forge:debugging" and follow it: the gate log already gives you a red, repeatable command, so start from there. Fix the cause at its source, with a regression test at an agreed seam where one fits. Commit the fix with a message naming the interaction that broke.
 

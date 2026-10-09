@@ -5,3 +5,6 @@
 .idea/
 .vscode/
 .DS_Store
+
+# Test scratch repos
+tests/.scratch/

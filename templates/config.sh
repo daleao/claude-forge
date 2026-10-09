@@ -75,6 +75,16 @@ FORGE_ALLOWED_TOOLS=(
   "Bash(git rm:*)" "Bash(git mv:*)" "Bash(git restore:*)" "Bash(mkdir:*)" "Bash(ls:*)"
 )
 
+# Extra tools for the QA reviewers and the recheck, on top of their read-only
+# set (Read, Grep, Glob, git diff/log/show). Use it for what the constitution
+# names as an authority to check the diff against: an MCP server's tools, one
+# name per entry, or an exact Bash command. Reviewers can never edit or write
+# files, whatever is listed. Changing the list makes the next audit cover the
+# whole branch. `forge doctor` checks that a worktree agent reaches each MCP
+# server named here or above.
+#FORGE_QA_TOOLS=("mcp__<server>__<tool>" "Bash(printenv SOME_API_URL)")
+FORGE_QA_TOOLS=()
+
 # What the cleanup pass may run, on top of reading files and `ls`. The pass
 # runs when a run ends: one agent reads the cleanup registry, removes what is
 # safe, and lists the rest in cleanup-manual.md for you. This list is its hard
