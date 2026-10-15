@@ -289,6 +289,7 @@ LINEAGE.md                   where each part came from, and why it is the way it
 | --- | --- | --- |
 | `FORGE_VERIFY_CMD` | none, required (a new project's foundation slice writes it) | the gate |
 | `FORGE_SETUP_CMD` | empty | run in each fresh worktree, and on the integration worktree after each merge (install deps) |
+| `FORGE_LIVE_CMD` | empty | tests against live services, kept out of the gate: run once per audit by the script, in the integration worktree after the gate, logged to `qa/live.log`. The report gives its verdict; a failure is listed as blocking for you, and fails nothing and starts no fix round |
 | `FORGE_BASE_BRANCH` | the repo's default branch, detected | integration branch is cut from it; the PR targets it |
 | `FORGE_MAX_PARALLEL` | 3 | slices running at once |
 | `FORGE_MAX_ITERATIONS` | 10 | fresh contexts per slice before it is parked |

@@ -73,6 +73,7 @@ check "with FORGE_QA_TOOLS empty, a reviewer is allowed the read-only tools and 
 check "FORGE_QA_TOOLS set in a slice's checkout does not reach the reviewers" lacks_arg "$c.args" Edit
 check "the report shows the constitution rule the branch added" has "$REPORT" "+- Rule added by the slice."
 check "the report has no such section's worth of unchanged rules" lacks "$REPORT" "+- Rule one."
+check "with FORGE_LIVE_CMD empty, the report says the live tests are not configured" has "$REPORT" "- not configured (FORGE_LIVE_CMD)"
 
 step unchanged
 forge qa 1 --local
@@ -219,6 +220,17 @@ done
 f="$(grep -l "fix round" "$FORGE_TEST_CALLS"/*.prompt | head -n1)"; c="$(grep -l "You are its cleanup pass" "$FORGE_TEST_CALLS"/*.prompt | head -n1)"
 check "the QA fixer gets the QA context thresholds" test "$(cat "${f%.prompt}.ctx")" == "200000 280000"
 check "the cleanup pass keeps the plain pair" test "$(cat "${c%.prompt}.ctx")" == "100000 140000"
+
+# ------------------------------------------------------------ live tests ----
+echo "FORGE_LIVE_CMD='echo ran >> live-runs.txt; exit 1'" >> "$R/.forge/config.sh"
+step live
+forge qa 1 --local --full; check "forge qa finishes when the live tests fail" test $? -eq 0
+INT="$R/.forge/worktrees/1/integration"
+check "the live tests ran once, in the integration worktree" test "$(cat "$INT/live-runs.txt")" == ran
+check "their output is logged" test -f "$RUN_E/qa/live.log"
+check "the report lists the failure as blocking" has "$RUN_E/qa/report.md" "- [BLOCKER] the live tests FAIL"
+check "a failure starts no fix round" test -z "$(grep -l "fix round" "$FORGE_TEST_CALLS"/*.prompt 2>/dev/null)"
+check "and does not fail the gate" has "$RUN_E/qa/report.md" "gate **PASS**"
 
 printf '\n%d passed, %d failed\n' "$pass" "$failed"
 (( failed == 0 ))

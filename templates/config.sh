@@ -18,6 +18,13 @@ FORGE_VERIFY_CMD=""
 # repeatable, e.g. "npm ci". Filled in the same way as the gate.
 FORGE_SETUP_CMD=""
 
+# Tests against live services, which the gate must not depend on. Run once
+# per audit by the script itself, in the integration worktree, after the gate,
+# and logged to .forge/runs/<spec>/qa/live.log. Its verdict goes in the report
+# for you: a failure is listed as blocking, but fails no gate and starts no
+# fix round. Like the gate, it must leave the worktree clean. Empty = not configured.
+FORGE_LIVE_CMD=""
+
 # ── Defaults (optional) ──────────────────────────────────────────────────────
 
 # Branch the integration branch is cut from, and the PR targets.

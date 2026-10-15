@@ -86,7 +86,7 @@ load_config() {
   FORGE_ALLOWED_TOOLS=(); FORGE_QA_TOOLS=(); FORGE_CLEANUP_TOOLS=(); unset FORGE_QA_DIFF_EXCLUDE
   # shellcheck disable=SC1091
   source "$REPO/.forge/config.sh"
-  : "${FORGE_VERIFY_CMD:=}" "${FORGE_SETUP_CMD:=}"
+  : "${FORGE_VERIFY_CMD:=}" "${FORGE_SETUP_CMD:=}" "${FORGE_LIVE_CMD:=}"
   [[ -n "${FORGE_BASE_BRANCH:-}" ]] || FORGE_BASE_BRANCH="$(default_branch)"
   : "${FORGE_MAX_PARALLEL:=3}" "${FORGE_MAX_ITERATIONS:=10}" "${FORGE_STALL_LIMIT:=2}"
   : "${FORGE_QA_MAX_ROUNDS:=2}" "${FORGE_MODEL_IMPLEMENT:=sonnet}"
@@ -919,7 +919,8 @@ qa_begin() {
   local q="$RUN/qa" f
   rm -f "$q/scope" "$q/diff.patch" "$q/slices.md" "$q/gate.log" "$q/gate.verdict" \
     "$q"/{spec,tests,code}-axis.md{,.rc,.err} "$q"/carry.md{,.rc,.err} "$q"/open-*.md \
-    "$q"/fix-[0-9]*.md "$q"/fix-*.patch "$q"/fix-*.base "$q"/fix-*.head "$q"/fix-*.gate "$q"/recheck-*.md*
+    "$q"/fix-[0-9]*.md "$q"/fix-*.patch "$q"/fix-*.base "$q"/fix-*.head "$q"/fix-*.gate "$q"/recheck-*.md* \
+    "$q/live.log" "$q/live.verdict"
   if [[ "$1" == followup ]]; then
     for f in history parked; do [[ ! -f "$q/$f.md" ]] || cp "$q/$f.md" "$q/carried-$f.md"; done
   else rm -f "$q"/carried-*.md "$q/standing.md" "$q/last-report.md"; fi
@@ -995,6 +996,16 @@ cmd_qa() {
     echo "$gate_verdict" > "$q/gate.verdict"
   fi
   gate_verdict="$(cat "$q/gate.verdict")"
+
+  # The live tests: once per audit, after the gate and outside it, run by the
+  # script and never by an agent. The command comes only from the config
+  # loaded at start, like the tool lists. Its verdict is the human's to weigh:
+  # it fails nothing and starts no fix round.
+  if [[ -n "$FORGE_LIVE_CMD" && ! -f "$q/live.verdict" ]]; then
+    log "QA: running the live tests (FORGE_LIVE_CMD), once for this audit"
+    if ( cd "$INT" && bash -c "$FORGE_LIVE_CMD" ) > "$q/live.log" 2>&1; then echo PASS > "$q/live.verdict"; else echo FAIL > "$q/live.verdict"; fi
+    ledger "qa: live tests $(cat "$q/live.verdict")"
+  fi
 
   for s in spec tests code; do
     [[ -z "$(reviewer_failure "$q/$s-axis.md" '^### Findings')" ]] || todo+=("$s")
@@ -1166,6 +1177,11 @@ write_report() { # <gate verdict> <open findings file> <rounds> <open count>
     echo
     echo "### Findings still open"
     { grep -E '^- \[(BLOCKER|IMPORTANT)\]' "$2" || echo "- none"; }
+    echo
+    echo "### Live tests"
+    if [[ -z "$FORGE_LIVE_CMD" ]]; then echo "- not configured (FORGE_LIVE_CMD)"
+    elif [[ "$(cat "$RUN/qa/live.verdict" 2>/dev/null)" == PASS ]]; then echo "- PASS, run once for this audit, outside the gate. Log: \`$RUN/qa/live.log\`"
+    else echo "- [BLOCKER] the live tests FAIL. They ran once for this audit, outside the gate, and no fix round was started: yours to judge. Log: \`$RUN/qa/live.log\`"; fi
     echo
     echo "### Findings parked for you (the fixer's questions, and declines the recheck could not settle)"
     if [[ -s "$RUN/qa/parked.md" ]]; then cat "$RUN/qa/parked.md"; else echo "- none"; fi
