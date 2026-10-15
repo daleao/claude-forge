@@ -1221,13 +1221,43 @@ write_report() { # <gate verdict> <open findings file> <rounds> <open count>
 # `rm` (files inside the workspace go with `forge clean`, files outside it are
 # always the human's); and it may run only FORGE_CLEANUP_TOOLS, with --yolo
 # or without. A removal it is not allowed to run becomes a manual step.
+# docker_facts <file>: Docker as the script sees it, for the cleanup pass. The
+# pass runs in the sandbox, where the Docker socket is out of reach; the script
+# is not. Only listings: nothing here changes anything.
+docker_facts() {
+  local v
+  {
+    printf '# Docker, as the forge script saw it at %s\n\n' "$(date '+%F %T')"
+    if ! command -v docker >/dev/null 2>&1; then v="docker is not on the script's PATH"
+    elif ! v="$(timeout 20 docker version --format '{{.Server.Version}}' 2>&1)"; then v="${v//$'\n'/ }"
+    else v=""; fi
+    if [[ -n "$v" ]]; then
+      printf 'Docker could not be reached from the forge script either: %s.\nEvery Docker check stays a manual step.\n' "$v"
+    else
+      docker_listing ps -a --no-trunc --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.CreatedAt}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.Label "org.testcontainers.sessionId"}}'
+      docker_listing compose ls -a
+      docker_listing volume ls --format 'table {{.Name}}\t{{.Driver}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "org.testcontainers.sessionId"}}'
+      docker_listing network ls --format 'table {{.ID}}\t{{.Name}}\t{{.Driver}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "org.testcontainers.sessionId"}}'
+    fi
+  } > "$1"
+}
+docker_listing() { # <docker args...>: one listing, under the command that made it
+  local rc=0
+  printf '## docker %s\n\n```\n' "$*"
+  timeout 20 docker "$@" 2>&1 || rc=$?
+  (( rc == 0 )) || printf '(exit %s)\n' "$rc"
+  printf '```\n\n'
+}
+
 cmd_cleanup() {
   local stamp out rc=0 why
   sweep
   [[ -s "$REGISTRY" ]] || { log "cleanup: nothing was recorded for #$SPEC"; return 0; }
   stamp="$(date +%Y%m%d-%H%M%S)"; out="$RUN/cleanup-agent-$stamp.log"
+  docker_facts "$RUN/cleanup-docker-$stamp.txt"
   log "cleanup: checking what the run left on the machine ($FORGE_MODEL_CLEANUP)"
   render "$FORGE_HOME/prompts/cleanup.md" "REGISTRY=$REGISTRY" "MANUAL=$MANUAL" "STAMP=$stamp" "SPEC_N=$SPEC" \
+      "DOCKER_FACTS=$RUN/cleanup-docker-$stamp.txt" \
       "WORKSPACE=$REPO/.forge" "VERIFY_CMD=$(gate_text "$INT")" "SETUP_CMD=$(cfg "$INT" FORGE_SETUP_CMD)" \
     | ( cd "$RUN" && "$CLAUDE" -p --model "$FORGE_MODEL_CLEANUP" "${PLUGIN_ARGS[@]}" --permission-mode acceptEdits \
         --allowedTools Read Edit Write Glob Grep "Bash(ls:*)" "${FORGE_CLEANUP_TOOLS[@]}" ) > "$out" 2>&1 || rc=$?

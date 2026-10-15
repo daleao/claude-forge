@@ -232,5 +232,22 @@ check "the report lists the failure as blocking" has "$RUN_E/qa/report.md" "- [B
 check "a failure starts no fix round" test -z "$(grep -l "fix round" "$FORGE_TEST_CALLS"/*.prompt 2>/dev/null)"
 check "and does not fail the gate" has "$RUN_E/qa/report.md" "gate **PASS**"
 
+# ------------------------------------------------- docker facts at cleanup --
+step docker-none
+( cd "$R" && PATH="$(dirname "$(command -v git)"):$(dirname "$(command -v jq)"):/usr/bin:/bin" "$FORGE" cleanup 1 ) > "$OUT" 2>&1
+d="$(ls -t "$RUN_E"/cleanup-docker-*.txt 2>/dev/null | head -n1)"
+check "the cleanup pass is given the script's Docker facts" has "$(grep -l "You are its cleanup pass" "$FORGE_TEST_CALLS"/*.prompt | head -n1)" "\`$d\`"
+if command -v docker >/dev/null 2>&1 && [[ "$(dirname "$(command -v docker)")" =~ ^/(usr/)?bin$ ]]; then ok "skipped: docker is on /usr/bin"
+else check "with no docker, the facts say Docker could not be reached" has "$d" "could not be reached from the forge script either"; fi
+
+mkdir -p "$S/bin"; printf '#!/bin/sh\necho "docker says: $*"\n' > "$S/bin/docker"; chmod +x "$S/bin/docker"
+step docker-facts
+( cd "$R" && PATH="$S/bin:$PATH" "$FORGE" cleanup 1 ) > "$OUT" 2>&1
+d="$(ls -t "$RUN_E"/cleanup-docker-*.txt | head -n1)"
+for l in "ps -a" "compose ls -a" "volume ls" "network ls"; do
+  check "the facts hold docker $l" has "$d" "docker says: $l"
+done
+check "the container listing shows the Compose and Testcontainers labels" bash -c 'grep -F "docker says: ps -a" "$1" | grep -F com.docker.compose.project.working_dir | grep -qF org.testcontainers.sessionId' _ "$d"
+
 printf '\n%d passed, %d failed\n' "$pass" "$failed"
 (( failed == 0 ))

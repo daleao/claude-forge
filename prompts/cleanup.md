@@ -16,6 +16,12 @@ What the loop ran on its own, in every worktree, and whose leftovers no agent ma
 
 The workspace is `{{WORKSPACE}}`. Everything else on the machine is the host.
 
+## Docker
+
+Where you run, the Docker socket is out of reach. The script, which can reach it, listed Docker just before you started: containers (with their Compose project, its working directory, and their Testcontainers session), Compose projects, volumes and networks, in `{{DOCKER_FACTS}}`. Judge every Docker record and journaled Docker command from that file, not by running docker: it is the machine as it stands, for step 1 below. A working directory inside the workspace ties a Compose project to this run.
+
+A Docker item the file shows that is safe to remove by the rules below is still removed only with a command you are allowed. If that command cannot reach Docker either, the item is a `FAILED` step for the human, with what the file showed. If the file says Docker could not be reached from the script either, every Docker item is a `MANUAL` step: say so in each one.
+
 ## For each record
 
 1. **Check it.** Find out whether the item still exists, with the read-only commands you are allowed. A record is a claim: the item may be gone, or may never have been what the record says. If you cannot check, say so in the verdict.
