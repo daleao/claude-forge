@@ -17,9 +17,9 @@ Next action: Read the ticket, fill the criteria table below, and start the first
 
 <!-- Choices made while building that the next iteration must not re-debate: what, and why. -->
 
-## Rulings
+## Choices
 
-<!-- Judgement calls made on the human's behalf, one list item each, in exactly this form: "Ruling: what you decided — why — what it costs if wrong". -->
+<!-- Judgement calls made on the human's behalf, one list item each, in exactly this form: "Choice: what you decided — why — what it costs if wrong". A choice never contradicts one of the human's rulings; before the slice merges, its choices are checked against them. -->
 
 ## Deferred
 

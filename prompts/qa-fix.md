@@ -3,14 +3,16 @@ An independent QA audit of this branch produced the findings in `{{FINDINGS}}`. 
 Read first:
 
 1. `{{CONSTITUTION}}`: the engineering rules for this repo.
-2. `{{FINDINGS}}`: every open finding. `[BLOCKER]` and `[IMPORTANT]` are yours; `[MINOR]` ones are left for the human.
-3. `{{SPEC}}`: the authority. `{{SLICES}}` holds the slice tickets.
+2. The human's rulings for this run: {{RULINGS}}. They bind you like the constitution.
+3. `{{FINDINGS}}`: every open finding. `[BLOCKER]` and `[IMPORTANT]` are yours; `[MINOR]` ones are left for the human.
+4. `{{SPEC}}`: the authority. `{{SLICES}}` holds the slice tickets.
 
 Treat each finding as a claim to verify, not an order. For each one, in the order listed:
 
 1. **Check it against the code.** Read what the finding points at. Reviewers work from a diff and are sometimes wrong.
-2. **If it is right**, fix it test-first: call the Skill tool with "forge:tdd". A finding about a missing or hollow test is fixed by a test that goes red for the right reason before it goes green. Commit each fix separately, naming the finding.
-3. **If it is wrong, or fixing it would contradict the spec**, change nothing and record why.
+2. **If it needs a decision that neither the spec nor the rulings settle, or fixing it would change behaviour a ruling sets**, change nothing and park it for the human, with the question they have to answer. Such a finding is never fixed on your judgement, and never settled in a commit.
+3. **If it is right**, fix it test-first: call the Skill tool with "forge:tdd". A finding about a missing or hollow test is fixed by a test that goes red for the right reason before it goes green. Commit each fix separately, naming the finding.
+4. **If it is wrong, or fixing it would contradict the spec or a ruling**, change nothing and record why.
 
 Then run the gate until it exits 0:
 
@@ -18,9 +20,14 @@ Then run the gate until it exits 0:
 {{VERIFY_CMD}}
 ```
 
-Finally write `{{NOTES}}`, one line per finding, in the findings' order:
+Finally write `{{NOTES}}`, one line per finding, in the findings' order, each in one of these forms:
 
-- `FIXED <finding, shortened> — <commit> — <the test that covers it>`
-- `DECLINED <finding, shortened> — Ruling: <why the code stands> — <what it costs if wrong>`
+```
+- FIXED <finding, shortened> — <commit> — <the test that covers it>
+- DECLINED <finding, shortened> — Choice: <why the code stands> — <what it costs if wrong>
+- PARKED <finding, shortened> — needs the human: <the question>
+```
+
+A `PARKED` line goes to the human as written, so the question must stand on its own.
 
 Fix only what the findings name. An improvement nobody asked for widens the diff the next reviewer has to recheck.

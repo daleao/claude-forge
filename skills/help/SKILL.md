@@ -16,7 +16,7 @@ Answer the user's question about what to do next from this map. If they asked no
 | 2 | **`/forge:spec`** | approve the tier and the draft | writes PRD/FDD sized to the work, publishes the spec issue |
 | 3 | **`/forge:slice <spec>`** | approve the breakdown | cuts vertical slices with blocking edges, publishes slice issues |
 | 4 | **`forge run <spec>`** (or `/forge:run`) | walk away | builds each slice test-first in a fresh-context loop, merges, audits, fixes, opens the PR |
-| 5 | **`/forge:review <spec>`** | decide | briefs you on rulings, open findings and parked slices; merges or revises |
+| 5 | **`/forge:review <spec>`** | decide | briefs you on choices, open findings and parked slices; merges or revises |
 
 Steps 1 to 3 belong in **one unbroken session**: the spec is written from the grilling, the slices from the spec, and a summary of either loses the reasoning. Step 4 runs outside any session. Step 5 can be a fresh session; everything it needs is in the report.
 
@@ -38,7 +38,7 @@ If `forge run` stops with `paused:` (exit status 75), it hit a usage limit or a 
 
 ## Around the flow
 
-- **`/forge:retro <spec>`**: after a run, turn its stalls, rulings and QA findings into changes to the agents' environment: checks, standards, slicing habits.
+- **`/forge:retro <spec>`**: after a run, turn its stalls, choices and QA findings into changes to the agents' environment: checks, standards, slicing habits.
 - **`/forge:architecture-survey`**: upkeep. Surveys the codebase for deepening opportunities and hands you candidates; picking one gives you an idea for step 1.
 - **`/forge:cleanup <spec>`**: after a run, go through what it left on your machine that the cleanup pass would not remove on its own, one step at a time.
 - **`/forge:qa <fixed point>`**: the QA audit by hand, on any branch.

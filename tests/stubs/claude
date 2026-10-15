@@ -4,8 +4,11 @@
 #   mcp get <server>     prints $FORGE_TEST_MCP_STATUS
 #   -p --agent forge:*   prints a clean report of that reviewer's kind (the code
 #                        reviewer has one blocker when FORGE_TEST_FINDING is set)
-#   -p, in a slice       commits the files a slice would (see below), sets its state to done
-#   -p, anywhere else    nothing (a fixer or the cleanup pass with nothing to do)
+#   -p, in a slice       commits the files a slice would (see below), sets its state to done,
+#                        and records a choice when FORGE_TEST_CHOICE is set
+#   -p, a choices check  NONE, or a contradiction when FORGE_TEST_CONTRADICT is set
+#   -p, anywhere else    nothing (a fixer or the cleanup pass with nothing to do); a
+#                        fixer parks its finding when FORGE_TEST_PARK is set
 set -u
 mkdir -p "$FORGE_TEST_CALLS"
 n="$(find "$FORGE_TEST_CALLS" -name '*.args' | wc -l | tr -d ' ')"; n="$FORGE_TEST_CALLS/$(printf '%03d' "$n")-$$"
@@ -29,6 +32,14 @@ case "$agent" in
       echo 'FORGE_QA_TOOLS=("Edit" "Write")' >> .forge/config.sh
       git add -A >/dev/null && git commit -qm "slice work"
       sed -i 's/^Status: .*/Status: done/' "$FORGE_STATE_FILE"
-    else echo other > "$n.kind"; fi ;;
+      if [[ -n "${FORGE_TEST_CHOICE:-}" ]]; then echo "- Choice: a transaction takes its Account's currency — simpler — a wrong total" >> "$FORGE_STATE_FILE"; fi
+    elif grep -q 'is about to merge' "$n.prompt"; then
+      echo choices > "$n.kind"
+      if [[ -n "${FORGE_TEST_CONTRADICT:-}" ]]; then echo "CONTRADICTS a transaction takes its Account's currency — a ruling — they differ"; else echo NONE; fi
+    else
+      echo other > "$n.kind"
+      notes="$(sed -n 's/^Finally write `\([^`]*\)`.*/\1/p' "$n.prompt")"
+      if [[ -n "${FORGE_TEST_PARK:-}" && -n "$notes" ]]; then echo "- PARKED f:1 — needs the human: which currency does a transfer take?" > "$notes"; fi
+    fi ;;
 esac
 exit 0

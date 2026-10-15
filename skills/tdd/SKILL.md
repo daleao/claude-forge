@@ -24,7 +24,7 @@ A **seam** is the public boundary you test at: the interface where you observe b
 **Test only at agreed seams.** You can't test everything, so agreeing the seams up front is how testing effort lands on the critical paths and complex logic instead of every edge case.
 
 - **With a user present**: write down the seams under test and confirm them before the first test. Ask: "What's the public interface, and which seams should we test?"
-- **Unattended (a loop iteration)**: the seams are the ones the spec's "Seams and testing decisions" section names. When a criterion can't be reached through any of them, take the highest existing seam that reaches it and record the choice as a **ruling** in the slice's state file.
+- **Unattended (a loop iteration)**: the seams are the ones the spec's "Seams and testing decisions" section names. When a criterion can't be reached through any of them, take the highest existing seam that reaches it and record it as a **choice** in the slice's state file.
 
 When the shape of that interface is itself in question (how deep the module is, where the seam belongs, what the interface should expose), call the Skill tool with "forge:codebase-design" for the vocabulary. It is a reference to consult, not a session to run.
 
@@ -50,4 +50,4 @@ When the shape of that interface is itself in question (how deep the module is, 
 | Don't know how to test it | Write the call you wish existed, then the assertion, then make them real. |
 | Test needs a mock for everything | The code is too coupled; inject the dependency at the seam. |
 | Setup dwarfs the assertion | The interface is too wide; simplify it before testing it. |
-| The seam can't reach the behaviour | A design finding. With a user, raise it; unattended, record a ruling. |
+| The seam can't reach the behaviour | A design finding. With a user, raise it; unattended, record a choice. |

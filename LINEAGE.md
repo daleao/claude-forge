@@ -164,7 +164,7 @@ Added after the first build, all **New**:
 
 - **Base idea**: GSD `templates/continue-here.md` (next action, completed, decisions, blockers) and `STATE.md`.
 - **Shape**: reduced to what one slice needs. GSD's velocity metrics, progress bars and session-continuity fields are cut. The Brief suggested six files per slice (spec, acceptance, state, decisions, progress, test-results); they are one file with sections here, because a fresh context that must open six files to orient spends its first minutes on that, and the ticket already is the spec and acceptance list.
-- **Added from SP**: the rulings section and its line format (machine-collected into the report).
+- **Added from SP**: the rulings section and its line format (machine-collected into the report). Renamed "Choices" (New): in a project the human's own decisions are its rulings, and they bind; an agent's decision is a choice, checked against them before its slice merges.
 - **Added from SP `verification`**: the evidence column. A criterion is a row with the command and the output line that proves it.
 
 ### `hooks/context-guard.sh`, `hooks/hooks.json`

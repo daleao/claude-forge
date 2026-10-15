@@ -64,6 +64,8 @@ step run
 forge run 1 --local; check "forge run finishes" test $? -eq 0
 i="$(first implement)"; c="$(first code)"
 check "the implementer is given its own worktree's constitution" has "$i.prompt" "\`$R/.forge/worktrees/1/slice-1/.forge/constitution.md\`"
+check "with no rulings file, the implementer is told there are none" has "$i.prompt" "the human has made no rulings"
+check "a slice with no choices has no check made" test -z "$(calls choices)"
 for k in spec tests code; do
   check "the $k reviewer is given the integration worktree's constitution" has "$(first $k).prompt" "Constitution: $INT/.forge/constitution.md"
 done
@@ -175,6 +177,37 @@ check "doctor reports the disabling file" has "$OUT" "disabledMcpjsonServers in 
 R="$S/b"; step doctor-none
 forge doctor
 check "doctor has nothing to say about MCP when the config names no server" lacks "$OUT" "MCP server"
+
+# ------------------------------------------------- rulings and choices ------
+new_repo e; RUN_E="$R/.forge/runs/1"; mkdir -p "$RUN_E"
+echo "- A transaction takes the currency of its Transfer, never its Account's." > "$RUN_E/rulings.md"
+step contradicts
+FORGE_TEST_CHOICE=1 FORGE_TEST_CONTRADICT=1 forge run 1 --local
+i="$(first implement)"; k="$(first choices)"
+check "the implementer is given the rulings file" has "$i.prompt" "\`$RUN_E/rulings.md\`"
+check "a slice with a choice and a rulings file has its choices checked" test -n "$k"
+check "the check is given the choice and the ruling" bash -c 'grep -qF "its Account'"'"'s currency" "$1" && grep -qF "never its Account" "$1"' _ "$k.prompt"
+check "the check is not given the diff" lacks "$k.prompt" "diff --git"
+check "the check may not write" bash -c 'sed -n "/^--disallowedTools$/,\$p" "$1" | grep -qx Write' _ "$k.args"
+check "a contradiction blocks the slice" test "$(cat "$RUN_E/slices/1/status")" == blocked
+check "and the slice is not merged" test ! -f "$R/.forge/worktrees/1/integration/work-slice-1.txt"
+check "the contradiction is in the ledger" has "$RUN_E/ledger.md" "CONTRADICTS a transaction"
+check "and in the state file" has "$RUN_E/slices/1/state.md" "  - CONTRADICTS a transaction"
+
+( cd "$R" && "$FORGE" unblock 1 1 ) >/dev/null 2>&1
+step choices-skip-qa
+FORGE_TEST_CHOICE=1 forge run 1 --local --skip-qa
+check "the check runs with --skip-qa" test -n "$(first choices)"
+check "no contradiction: the slice merges" test "$(cat "$RUN_E/slices/1/status")" == merged
+
+step rulings-qa
+FORGE_TEST_FINDING=1 FORGE_TEST_PARK=1 forge qa 1 --local
+for k in spec tests code recheck; do
+  check "the $k reviewer is given the rulings file" has "$(first $k).prompt" "The human's rulings (binding): \`$RUN_E/rulings.md\`"
+done
+check "the QA fixer is given the rulings file" has "$(first other).prompt" "\`$RUN_E/rulings.md\`"
+check "the fixer's parked finding reaches the report" has "$RUN_E/qa/report.md" "- PARKED f:1 — needs the human: which currency"
+check "the report lists the agents' choices" bash -c 'grep -qF "### Choices: decisions the agents made" "$1" && grep -qF -- "- Choice: a transaction takes" "$1"' _ "$RUN_E/qa/report.md"
 
 printf '\n%d passed, %d failed\n' "$pass" "$failed"
 (( failed == 0 ))

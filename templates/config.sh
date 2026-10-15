@@ -56,6 +56,7 @@ FORGE_MODEL_IMPLEMENT="sonnet"   # slice iterations, merge resolution
 FORGE_MODEL_ESCALATE="opus"      # a stalled slice, audit fixes
 FORGE_MODEL_QA="opus"            # the three reviewers and the recheck
 #FORGE_MODEL_CLEANUP="opus"      # the cleanup pass (unset = FORGE_MODEL_QA)
+#FORGE_MODEL_CHOICES="sonnet"    # a slice's choices against your rulings, before it merges
 
 # Context guard thresholds, in tokens: when an iteration is told to finish its
 # increment, and when it is told to checkpoint immediately.

@@ -90,7 +90,7 @@ load_config() {
   [[ -n "${FORGE_BASE_BRANCH:-}" ]] || FORGE_BASE_BRANCH="$(default_branch)"
   : "${FORGE_MAX_PARALLEL:=3}" "${FORGE_MAX_ITERATIONS:=10}" "${FORGE_STALL_LIMIT:=2}"
   : "${FORGE_QA_MAX_ROUNDS:=2}" "${FORGE_MODEL_IMPLEMENT:=sonnet}"
-  : "${FORGE_MODEL_ESCALATE:=opus}" "${FORGE_MODEL_QA:=opus}"
+  : "${FORGE_MODEL_ESCALATE:=opus}" "${FORGE_MODEL_QA:=opus}" "${FORGE_MODEL_CHOICES:=sonnet}"
   : "${FORGE_NOTIFY_CMD:=}"
   : "${FORGE_USAGE_STOP_PERCENT=90}" "${FORGE_USAGE_MAX_AGE:=900}"   # set it to "" to switch the threshold off
   (( ${#FORGE_ALLOWED_TOOLS[@]} )) || FORGE_ALLOWED_TOOLS=("${DEFAULT_TOOLS[@]}")
@@ -264,6 +264,15 @@ cfg() {
 # before it exists, or when the constitution was never committed.
 constitution_of() {
   if [[ -f "$1/.forge/constitution.md" ]]; then printf '%s' "$1/.forge/constitution.md"; else printf '%s' "$CONSTITUTION"; fi
+}
+
+# rulings_ref: the human's rulings in force for this run, as an agent is
+# pointed at them. A ruling is the human's decision and binds every agent like
+# the constitution; an agent's own decisions are choices. The file is the
+# human's: no agent writes it.
+rulings_ref() {
+  if [[ -s "$RUN/rulings.md" ]]; then printf '`%s`' "$RUN/rulings.md"
+  else printf 'none (the human has made no rulings for this run: there is no %s)' "$RUN/rulings.md"; fi
 }
 
 gate_text() { # <dir>: the gate command as shown to an agent
@@ -462,7 +471,7 @@ slice_loop() { # <slice>: runs in the background; its verdict is the status file
     i=$((i + 1)); stamp="$(date +%Y%m%d-%H%M%S)"
     before="$(signature "$wt" "$state")"
     log "slice #$s: iteration $i ($model)"
-    render "$FORGE_HOME/prompts/implement.md" "CONSTITUTION=$(constitution_of "$wt")" "TICKET=$dir/ticket.md" \
+    render "$FORGE_HOME/prompts/implement.md" "CONSTITUTION=$(constitution_of "$wt")" "RULINGS=$(rulings_ref)" "TICKET=$dir/ticket.md" \
         "STATE=$state" "SPEC=$RUN/spec.md" "VERIFY_CMD=$(gate_text "$wt")" \
       | FORGE_STATE_FILE="$state" agent "$wt" "$model" "$dir/iter-$stamp.log"
     # A call that failed (usage limit, network, crash) says nothing about the
@@ -500,8 +509,38 @@ slice_loop() { # <slice>: runs in the background; its verdict is the status file
 
 # ----------------------------------------------------------------- merge ----
 
+# check_choices <slice>: before a done slice merges, hold the choices its
+# agents made against the human's rulings and the constitution. One read-only
+# call that is given those three and not the diff. A contradiction blocks the
+# slice, unmerged; a failed call pauses the run with the slice still done, so
+# the check runs again on resume. No choices, or no rulings, and no call is
+# made. --skip-qa skips the audit, not this.
+check_choices() {
+  local s="$1" dir="$RUN/slices/$1" out="$RUN/slices/$1/choices-check.md" choices found why line rc=0
+  # "- Ruling:" is how state files written before the rename record a choice.
+  choices="$({ grep -E '^- (Choice|Ruling):' "$dir/state.md" 2>/dev/null || true; })"
+  [[ -n "$choices" && -s "$RUN/rulings.md" ]] || return 0
+  log "slice #$s: checking its choices against the human's rulings ($FORGE_MODEL_CHOICES)"
+  rm -f "$out" "$out.rc"
+  render "$FORGE_HOME/prompts/choices.md" "SLICE=$s" "CHOICES=$choices" "RULINGS=$(cat "$RUN/rulings.md")" \
+      "CONSTITUTION=$(cat "$(constitution_of "$WT/slice-$s")" 2>/dev/null)" \
+    | ( cd "$RUN" && "$CLAUDE" -p --model "$FORGE_MODEL_CHOICES" --disallowedTools Bash Edit Write NotebookEdit Agent ) \
+      > "$out.part" 2> "$out.err" || rc=$?
+  echo "$rc" > "$out.rc"; mv "$out.part" "$out"
+  why="$(reviewer_failure "$out" '^(CONTRADICTS|NONE)')"
+  if [[ -n "$why" ]]; then halt "$why in the check of slice #$s's choices against the rulings (see $out)"; return 1; fi
+  found="$({ grep -E '^CONTRADICTS' "$out" || true; })"
+  [[ -n "$found" ]] || return 0
+  { printf -- '- %s: choices contradict the human'"'"'s rulings, so the slice was not merged. Change the code and the choice, or stop as blocked if you believe the ruling is wrong:\n' "$(date +%Y%m%d-%H%M%S)"
+    printf '%s\n' "$found" | sed 's/^/  - /'; } >> "$dir/state.md"
+  while IFS= read -r line; do ledger "slice $s: $line"; done <<< "$found"
+  block "$s" "$(wc -l <<< "$found" | tr -d ' ') choice(s) contradict the human's rulings; not merged (see $out)"
+  return 1
+}
+
 merge_slice() { # <slice>: bring a done slice onto the integration branch, or park it
   local s="$1" dir="$RUN/slices/$1" br="forge/$SPEC/slice-$1" pre title fail
+  check_choices "$s" || return 0
   title="$(title_of "$dir/ticket.md")"
   pre="$(git -C "$INT" rev-parse HEAD)"
   local -a vars=("SLICE=$s" "TICKET=$dir/ticket.md" "STATE=$dir/state.md" "SPEC=$RUN/spec.md" "CONSTITUTION=$(constitution_of "$INT")"
@@ -845,6 +884,7 @@ Audit the branch checked out in this directory.
 - Diff (commit list, stat, full diff with context): $RUN/qa/diff.patch
 - Gate log ($1): $RUN/qa/gate.log
 - Constitution: $(constitution_of "$INT")
+- The human's rulings (binding): $(rulings_ref)
 - Lens directory: $FORGE_HOME/skills/qa/lenses
 EOF
   [[ "$QA_MODE" == followup ]] || return 0
@@ -979,6 +1019,7 @@ A follow-up audit. The commits since the last audit are new work, not a fix roun
 - Diff of the commits since that audit: $q/diff.patch
 - Spec: $RUN/spec.md
 - Constitution: $(constitution_of "$INT")
+- The human's rulings (binding): $(rulings_ref)
 - Gate log ($gate_verdict): $q/gate.log
 EOF
     why="$(reviewer_failure "$q/carry.md" "$RECHECK_RE")"
@@ -1013,7 +1054,7 @@ This round was started before and interrupted. What it committed is kept: \`git 
         git -C "$INT" rev-parse HEAD > "$q/fix-$r.base"
         log "QA: $open blocking finding(s); fix round $r/$FORGE_QA_MAX_ROUNDS"
       fi
-      { render "$FORGE_HOME/prompts/qa-fix.md" "CONSTITUTION=$(constitution_of "$INT")" "FINDINGS=$findings" "SPEC=$RUN/spec.md" \
+      { render "$FORGE_HOME/prompts/qa-fix.md" "CONSTITUTION=$(constitution_of "$INT")" "RULINGS=$(rulings_ref)" "FINDINGS=$findings" "SPEC=$RUN/spec.md" \
           "SLICES=$q/slices.md" "VERIFY_CMD=$(gate_text "$INT")" "NOTES=$q/fix-$r.md" "ROUND=$r"
         printf '%s\n' "$note"; } | agent "$INT" "$FORGE_MODEL_ESCALATE" "$q/fix-agent-$r$retry.log"
       why="$(agent_failure "$q/fix-agent-$r$retry.log")"
@@ -1037,6 +1078,7 @@ Re-review fix round $r.
 - Fix diff: $q/fix-$r.patch
 - Spec: $RUN/spec.md
 - Constitution: $(constitution_of "$INT")
+- The human's rulings (binding): $(rulings_ref)
 - Gate log after the fixes ($gate_verdict): $q/gate.log
 EOF
       why="$(reviewer_failure "$q/recheck-$r.md" "$RECHECK_RE")"
@@ -1053,7 +1095,9 @@ EOF
   done
 
   # Everything below is rebuilt from the stage files, so a pause here repeats it harmlessly.
+  # Parked: what the fixer left for the human, and what the recheck parked.
   { cat "$q/carried-parked.md" 2>/dev/null || true
+    { grep -hE '^(- )?PARKED ' "$q"/fix-[0-9]*.md 2>/dev/null || true; } | sed -E 's/^(- )?/- /'
     grep -hE '^- \[PARKED\]' "$q"/carry.md "$q"/recheck-*.md 2>/dev/null || true; } > "$q/parked.md"
   write_report "$gate_verdict" "$findings" "$r" "$open"
   { printf '### Audit of %s..%s, %s\n\n' "${QA_FROM:0:12}" "${QA_PIN:0:12}" "$(date +%F)"
@@ -1119,11 +1163,16 @@ write_report() { # <gate verdict> <open findings file> <rounds> <open count>
     echo "### Findings still open"
     { grep -E '^- \[(BLOCKER|IMPORTANT)\]' "$2" || echo "- none"; }
     echo
-    echo "### Findings the fixer declined (parked for you)"
+    echo "### Findings parked for you (the fixer's questions, and declines the recheck could not settle)"
     if [[ -s "$RUN/qa/parked.md" ]]; then cat "$RUN/qa/parked.md"; else echo "- none"; fi
     echo
-    echo "### Rulings: decisions the agents made on your behalf"
-    { grep -hE '^- Ruling:' "$RUN"/slices/*/state.md "$RUN"/qa/fix-[0-9]*.md "$RUN/qa/carried-history.md" 2>/dev/null || echo "- none"; }
+    echo "### Rulings the reviewers question"
+    { for f in spec tests code; do awk '/^### / { on = ($0 ~ /^### Rulings questioned/); next } on && /^- / && !/^- none/' "$RUN/qa/$f-axis.md" 2>/dev/null; done
+      true; } | awk '!seen[$0]++' | grep . || echo "- none"
+    echo
+    echo "### Choices: decisions the agents made on your behalf"
+    # "- Ruling:" is how state files and fix notes written before the rename record a choice.
+    { grep -hE '^- (Choice|Ruling):' "$RUN"/slices/*/state.md "$RUN"/qa/fix-[0-9]*.md "$RUN/qa/carried-history.md" 2>/dev/null || echo "- none"; }
     echo
     echo "### Minor findings (not fixed)"
     { grep -E '^- \[MINOR\]' "$2" || echo "- none"; }

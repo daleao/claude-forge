@@ -176,7 +176,9 @@ To pause *before* the limit, use `forge-usage-statusline` as your status line (`
 
 Things that stop a slice instead of guessing: an architectural change the spec didn't sanction, a dependency that fails to install, a destructive operation, a contradiction between ticket and spec, three failed fixes for the same problem, a stall that survives a model escalation, or the iteration budget. A parked slice holds back only the slices behind it.
 
-Everything else the agent decides and writes down as a **ruling**: what it decided, why, what it costs if wrong. You read every one at review.
+Everything else the agent decides and writes down as a **choice**: what it decided, why, what it costs if wrong. You read every one at review.
+
+A **ruling** is yours: a decision you made, binding on every agent. Write the rulings in force for a run in `.forge/runs/42/rulings.md`, one per line. The implementers, the fixer, the reviewers and the recheck are all given the file; an implementer stops as blocked rather than build against a ruling, and a fixer parks a finding a ruling decides instead of fixing it. Before a slice merges, a read-only check (`FORGE_MODEL_CHOICES`) holds its choices against your rulings and the constitution, and a contradiction keeps the slice from merging. That check runs with `--skip-qa` too.
 
 Watching and steering:
 
@@ -197,13 +199,13 @@ forge cleanup 42              # run the cleanup pass (a paused or interrupted ru
 
 The agent starts with what the run left on your machine: what the cleanup pass removed, and the steps it left for you. `/forge:cleanup 42` takes you through those one at a time, checking each item, showing the command, and waiting for your answer before anything is removed.
 
-Then it briefs you from the report, decisions first: slices that didn't merge, findings still open, findings the fixer declined (with both sides), and every ruling. Then the questions no audit answers: is this what you wanted, does it behave right when you use it, are the trade-offs acceptable, would you maintain it.
+Then it briefs you from the report, decisions first: slices that didn't merge, findings still open, findings parked for you (with both sides), and every choice. Then the questions no audit answers: is this what you wanted, does it behave right when you use it, are the trade-offs acceptable, would you maintain it.
 
 - Small corrections are made on the spot, test-first.
 - Bigger rework becomes new slices appended to the spec; `forge run 42` builds only those and audits only what they added.
 - When you're satisfied, merge the PR (its `Closes` lines resolve the issues), then `forge clean 42`.
 
-Afterwards, `/forge:retro 42` turns the run's stalls, rulings and QA findings into improvements to the agents' environment: a new check in the gate, a constitution rule, a slicing habit.
+Afterwards, `/forge:retro 42` turns the run's stalls, choices and QA findings into improvements to the agents' environment: a new check in the gate, a constitution rule, a slicing habit.
 
 ## Class mode: `/forge:teach`
 
@@ -234,7 +236,8 @@ The project memory hierarchy, and who reads what:
 | Domain: vocabulary | `GLOSSARY.md` | everyone |
 | Decisions | `docs/adr/` | everyone; binding on implementers |
 | Specs and slices | GitHub issues `forge:spec`, `forge:slice` | humans; snapshotted for agents |
-| Slice state: criteria + evidence, decisions, rulings, next action | `.forge/runs/<spec>/slices/<n>/state.md` | the next iteration of that slice |
+| Slice state: criteria + evidence, decisions, choices, next action | `.forge/runs/<spec>/slices/<n>/state.md` | the next iteration of that slice |
+| Your rulings for a run, binding on every agent | `.forge/runs/<spec>/rulings.md`, one per line; written by you, never by an agent | implementers, the QA fixer, reviewers and recheck; the check of choices before a merge |
 | Run state: ledger, statuses, logs, QA report | `.forge/runs/<spec>/` | the script; you; `/forge:retro` |
 | Cleanup registry: what each agent and the script left on the machine, and the cleanup pass's verdicts | `.forge/runs/<spec>/cleanup-registry.md` | the cleanup pass; you |
 | Manual cleanup: the steps the pass would not take, with instructions | `.forge/runs/<spec>/cleanup-manual.md` | you; `/forge:review`, `/forge:cleanup` |
@@ -294,6 +297,7 @@ LINEAGE.md                   where each part came from, and why it is the way it
 | `FORGE_QA_DIFF_EXCLUDE` | the usual lock files | git glob pathspecs whose content is left out of the diff the reviewers read; the file is still listed. Setting it replaces the default; `()` leaves nothing out |
 | `FORGE_MODEL_IMPLEMENT` / `_ESCALATE` / `_QA` | `sonnet` / `opus` / `opus` | model per role |
 | `FORGE_MODEL_CLEANUP` | same as `FORGE_MODEL_QA` | model for the cleanup pass |
+| `FORGE_MODEL_CHOICES` | `sonnet` | model for the check of a slice's choices against your rulings, before it merges |
 | `FORGE_CLEANUP_TOOLS` | empty; the config template sets it to: inspect Docker and processes, stop and remove containers and networks | everything the cleanup pass may run besides reading files, `--yolo` or not; a removal outside this list becomes a manual step |
 | `FORGE_USAGE_STOP_PERCENT` | 90 | pause when 5-hour or 7-day usage reaches this percentage; `""` switches it off |
 | `FORGE_USAGE_MAX_AGE` | 900 | seconds before a usage reading is treated as stale and ignored |

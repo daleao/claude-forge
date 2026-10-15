@@ -3,7 +3,7 @@ A merge of slice #{{SLICE}} into the integration branch stopped on conflicts. Yo
 Read first:
 
 1. `{{TICKET}}`: what the slice being merged was built to do.
-2. `{{STATE}}`: its decisions and rulings.
+2. `{{STATE}}`: its decisions and choices.
 3. `{{SPEC}}`: the parent spec, the authority when the two sides disagree.
 4. `{{CONSTITUTION}}`: the engineering rules for this repo. If it is one of the conflicted files, keep every rule from both sides.
 
