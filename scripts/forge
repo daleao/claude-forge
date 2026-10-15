@@ -363,15 +363,19 @@ sweep() {
 # lets a reviewer consult (an MCP server's tools, an exact Bash command); like
 # FORGE_ALLOWED_TOOLS it comes only from the config loaded at start. The agent
 # files themselves take the file-writing tools away, with --yolo or without.
+# A reviewer writes no files, but what it runs is journaled and registered
+# like any agent's, so the cleanup pass can account for it.
 reviewer() {
   local name="$1" model="$2" out="$3" rc=0
   local -a perms
   rm -f "$out" "$out.rc"   # a call that is killed leaves no report, so the stage runs again
   if (( YOLO )); then perms=(--dangerously-skip-permissions)
   else perms=(--allowedTools Read Grep Glob "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "${FORGE_QA_TOOLS[@]}"); fi
-  ( cd "$INT" && "$CLAUDE" -p --agent "forge:$name" --model "$model" "${PLUGIN_ARGS[@]}" \
+  : > "$out.open"   # this call's records are not in the registry yet (see register)
+  ( cd "$INT" && FORGE_JOURNAL="$out.commands.log" "$CLAUDE" -p --agent "forge:$name" --model "$model" "${PLUGIN_ARGS[@]}" \
       --add-dir "$RUN" --add-dir "$FORGE_HOME" "${perms[@]}" ) > "$out.part" 2> "$out.err" || rc=$?
   echo "$rc" > "$out.rc"; mv "$out.part" "$out"
+  register "$out"
 }
 
 # ------------------------------------------------------------- snapshots ----

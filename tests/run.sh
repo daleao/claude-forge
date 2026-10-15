@@ -249,5 +249,14 @@ for l in "ps -a" "compose ls -a" "volume ls" "network ls"; do
 done
 check "the container listing shows the Compose and Testcontainers labels" bash -c 'grep -F "docker says: ps -a" "$1" | grep -F com.docker.compose.project.working_dir | grep -qF org.testcontainers.sessionId' _ "$d"
 
+# ------------------------------------------------ reviewers' journals -------
+step journals
+forge qa 1 --local --full
+for k in spec tests code; do
+  check "the $k reviewer keeps a command journal" test "$(cat "$(first $k).journal")" == "$RUN_E/qa/$k-axis.md.commands.log"
+  check "and the $k reviewer's call is in the cleanup registry" has "$RUN_E/cleanup-registry.md" "agent qa/$k-axis.md"
+done
+check "no reviewer call is left unregistered" test -z "$(find "$RUN_E/qa" -name '*.open')"
+
 printf '\n%d passed, %d failed\n' "$pass" "$failed"
 (( failed == 0 ))
