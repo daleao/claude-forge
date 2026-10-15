@@ -63,6 +63,11 @@ FORGE_MODEL_QA="opus"            # the three reviewers and the recheck
 export FORGE_CTX_WARN=100000
 export FORGE_CTX_CRITICAL=140000
 
+# The same two for the audit: the reviewers, the recheck and the fix rounds,
+# which read a whole branch's diff. Unset = the pair above.
+#FORGE_CTX_WARN_QA=200000
+#FORGE_CTX_CRITICAL_QA=280000
+
 # Tools unattended agents may use without `--yolo`. On top of this list, the
 # script automatically allows the commands your gate and setup commands start
 # with (for "npm test && npx tsc", that is npm and npx), so most projects need

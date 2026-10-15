@@ -209,5 +209,16 @@ check "the QA fixer is given the rulings file" has "$(first other).prompt" "\`$R
 check "the fixer's parked finding reaches the report" has "$RUN_E/qa/report.md" "- PARKED f:1 — needs the human: which currency"
 check "the report lists the agents' choices" bash -c 'grep -qF "### Choices: decisions the agents made" "$1" && grep -qF -- "- Choice: a transaction takes" "$1"' _ "$RUN_E/qa/report.md"
 
+# ----------------------------------------------- QA context thresholds ------
+printf 'export FORGE_CTX_WARN=100000 FORGE_CTX_CRITICAL=140000\nFORGE_CTX_WARN_QA=200000\nFORGE_CTX_CRITICAL_QA=280000\n' >> "$R/.forge/config.sh"
+step ctx-qa
+FORGE_TEST_FINDING=1 forge qa 1 --local --full
+for k in spec tests code recheck; do
+  check "the $k reviewer gets the QA context thresholds" test "$(cat "$(first $k).ctx")" == "200000 280000"
+done
+f="$(grep -l "fix round" "$FORGE_TEST_CALLS"/*.prompt | head -n1)"; c="$(grep -l "You are its cleanup pass" "$FORGE_TEST_CALLS"/*.prompt | head -n1)"
+check "the QA fixer gets the QA context thresholds" test "$(cat "${f%.prompt}.ctx")" == "200000 280000"
+check "the cleanup pass keeps the plain pair" test "$(cat "${c%.prompt}.ctx")" == "100000 140000"
+
 printf '\n%d passed, %d failed\n' "$pass" "$failed"
 (( failed == 0 ))

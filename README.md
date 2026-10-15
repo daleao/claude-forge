@@ -305,6 +305,7 @@ LINEAGE.md                   where each part came from, and why it is the way it
 | `FORGE_ALLOWED_TOOLS` | file tools and basic git | what agents may do without `--yolo`; the commands your gate and setup commands start with are added automatically |
 | `FORGE_QA_TOOLS` | empty | extra tools for the QA reviewers and the recheck, on top of their read-only set: an MCP server's tools (`mcp__<server>__<tool>`, one per entry) or an exact Bash command, for checking the diff against an authority the constitution names. Read only from your checkout's config, like `FORGE_ALLOWED_TOOLS`. Changing it makes the next audit cover the whole branch |
 | `FORGE_CTX_WARN` / `FORGE_CTX_CRITICAL` | 100000 / 140000 | context guard thresholds in tokens: finish the increment, then checkpoint now |
+| `FORGE_CTX_WARN_QA` / `FORGE_CTX_CRITICAL_QA` | the pair above | the same thresholds for the audit: the reviewers, the recheck and the fix rounds |
 
 ## Safety
 

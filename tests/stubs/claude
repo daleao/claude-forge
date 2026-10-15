@@ -13,6 +13,7 @@ set -u
 mkdir -p "$FORGE_TEST_CALLS"
 n="$(find "$FORGE_TEST_CALLS" -name '*.args' | wc -l | tr -d ' ')"; n="$FORGE_TEST_CALLS/$(printf '%03d' "$n")-$$"
 printf '%s\n' "$@" > "$n.args"
+printf '%s %s\n' "${FORGE_CTX_WARN:-}" "${FORGE_CTX_CRITICAL:-}" > "$n.ctx"
 if [[ "${1:-}" == mcp ]]; then echo mcp > "$n.kind"; printf '%s:\n  Status: %s\n' "${3:-}" "${FORGE_TEST_MCP_STATUS:-✔ Connected}"; exit 0; fi
 cat > "$n.prompt"
 agent=""; prev=""

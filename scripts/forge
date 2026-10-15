@@ -954,6 +954,10 @@ cmd_qa() {
   local base head key gate_verdict r open findings s why note retry q="$RUN/qa"
   local ahead="" abase="" akey=""
   local -a todo=()
+  # The audit's contexts read a whole branch, so the project may give them
+  # context guard thresholds of their own. Every other phase keeps the plain pair.
+  [[ -z "${FORGE_CTX_WARN_QA:-}" ]] || local -x FORGE_CTX_WARN="$FORGE_CTX_WARN_QA"
+  [[ -z "${FORGE_CTX_CRITICAL_QA:-}" ]] || local -x FORGE_CTX_CRITICAL="$FORGE_CTX_CRITICAL_QA"
   git -C "$REPO" show-ref --verify --quiet "refs/heads/$INT_BRANCH" || die "no integration branch for #$SPEC (nothing has run yet)"
   ensure_integration
   sync_base
