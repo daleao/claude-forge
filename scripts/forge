@@ -207,10 +207,13 @@ agent_failure() {
 }
 
 # reviewer_failure <report> <regex a real report matches>: an empty or
-# malformed report is a failed audit, never a clean one.
+# malformed report is a failed audit, never a clean one. A failed call names
+# the copy of its error output that reviewer() kept.
 reviewer_failure() {
-  local why; why="$(agent_failure "$1")"
-  if [[ -n "$why" ]]; then echo "$why"
+  local why kept; why="$(agent_failure "$1")"
+  if [[ -n "$why" ]]; then
+    kept="$(ls -t "$1".err.[0-9]* 2>/dev/null | head -n1)"
+    echo "$why${kept:+; its error output is kept at $kept}"
   elif ! grep -qE "$2" "$1" 2>/dev/null; then
     if looks_limited "$1"; then echo "usage limit reached"; else echo "its output is not a report"; fi
   fi
@@ -375,6 +378,8 @@ reviewer() {
   ( cd "$INT" && FORGE_JOURNAL="$out.commands.log" "$CLAUDE" -p --agent "forge:$name" --model "$model" "${PLUGIN_ARGS[@]}" \
       --add-dir "$RUN" --add-dir "$FORGE_HOME" "${perms[@]}" ) > "$out.part" 2> "$out.err" || rc=$?
   echo "$rc" > "$out.rc"; mv "$out.part" "$out"
+  # The next try truncates <report>.err, and with it the only clue to why this one failed.
+  (( rc == 0 )) || cp "$out.err" "$out.err.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
   register "$out"
 }
 

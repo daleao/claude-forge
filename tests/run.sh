@@ -258,5 +258,16 @@ for k in spec tests code; do
 done
 check "no reviewer call is left unregistered" test -z "$(find "$RUN_E/qa" -name '*.open')"
 
+# --------------------------------------- a failed reviewer's error output --
+step reviewer-fails
+FORGE_TEST_FAIL_REVIEWER=spec forge qa 1 --local --full; rc=$?
+check "a failed reviewer pauses the audit" test "$rc" -eq 75
+kept="$(ls "$RUN_E"/qa/spec-axis.md.err.[0-9]* 2>/dev/null | head -n1)"
+check "its error output is kept under a name of its own" has "$kept" "the reason this call failed"
+check "the halt line in the ledger names that file" bash -c 'grep "halt: The spec reviewer produced no report" "$1" | grep -qF "$2"' _ "$RUN_E/ledger.md" "$kept"
+step reviewer-retry
+forge qa 1 --local; check "the resumed audit finishes" test $? -eq 0
+check "the retry leaves the kept error output as it was" has "$kept" "the reason this call failed"
+
 printf '\n%d passed, %d failed\n' "$pass" "$failed"
 (( failed == 0 ))

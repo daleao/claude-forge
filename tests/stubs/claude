@@ -19,6 +19,9 @@ if [[ "${1:-}" == mcp ]]; then echo mcp > "$n.kind"; printf '%s:\n  Status: %s\n
 cat > "$n.prompt"
 agent=""; prev=""
 for a in "$@"; do [[ "$prev" == --agent ]] && agent="$a"; prev="$a"; done
+if [[ -n "$agent" && "$agent" == "forge:qa-${FORGE_TEST_FAIL_REVIEWER:-}" ]]; then
+  echo failed > "$n.kind"; echo "API Error: 500 the reason this call failed" >&2; exit 1
+fi
 case "$agent" in
   forge:qa-recheck) echo recheck > "$n.kind"; echo "- [ADDRESSED] a finding — file:1" ;;
   forge:qa-code) echo code > "$n.kind"; printf '### Findings\n'
